@@ -131,6 +131,7 @@ dmypy.json
 
 # Model checkpoints and outputs
 outputs/
+Wan21/wan_models/
 *.safetensors
 *.bin
 *.pt

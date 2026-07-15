@@ -7,7 +7,7 @@ from torchvision import transforms
 from torchvision.io import write_video
 from einops import rearrange
 import torch.distributed as dist
-from torch.utils.data import DataLoader, SequentialSampler
+from torch.utils.data import DataLoader, SequentialSampler, Subset
 from torch.utils.data.distributed import DistributedSampler
 import json
 
@@ -23,12 +23,16 @@ parser.add_argument("--checkpoint_path", type=str, help="Path to the checkpoint 
 parser.add_argument("--data_path", type=str, help="Path to the dataset")
 parser.add_argument("--output_folder", type=str, help="Output folder")
 parser.add_argument("--num_output_frames", type=int, default=20, help="Number of overlap frames between sliding windows")
+parser.add_argument("--max_prompts", type=int, default=-1, help="Maximum number of prompts to run. <=0 means all prompts.")
+parser.add_argument("--prompt_start", type=int, default=0, help="Start prompt index for subset inference.")
 parser.add_argument("--use_ema", action="store_true", help="Whether to use EMA parameters")
 parser.add_argument("--seed", type=int, default=0, help="Random seed")
 parser.add_argument("--i2v", action="store_true", help="Whether to perform I2V (or T2V by default)")
 parser.add_argument("--sp_size", type=int, default=1, help="Sequence parallel size (1=disabled)")
 parser.add_argument("--trajectory", type=str, default=None, help="Camera trajectory string (e.g., 'w*19' for camera control)")
 parser.add_argument("--trajectory_path", type=str, default=None, help="Path to trajectory file (one trajectory string per line, aligned with data_path)")
+parser.add_argument("--log_cache_state", action="store_true", help="Log per-block KV/PRoPE cache state and CUDA memory.")
+parser.add_argument("--log_cache_interval", type=int, default=1, help="Log every N generated blocks when --log_cache_state is enabled.")
 args = parser.parse_args()
 
 # Initialize distributed inference
@@ -78,6 +82,8 @@ torch.set_grad_enabled(False)
 config = OmegaConf.load(args.config_path)
 default_config = OmegaConf.load("Wan21/configs/default_config.yaml")
 config = OmegaConf.merge(default_config, config)
+config.log_cache_state = args.log_cache_state
+config.log_cache_interval = max(1, args.log_cache_interval)
 
 # Import pipeline AFTER distributed init so causal_model.py sees CleanCode SP infra
 from pipeline import (
@@ -142,8 +148,24 @@ if args.i2v:
     dataset = TextImagePairDataset(args.data_path, transform=transform)
 else:
     dataset = TextDataset(prompt_path=args.data_path)
+original_num_prompts = len(dataset)
+assert args.prompt_start >= 0, f"prompt_start must be >= 0, got {args.prompt_start}"
+assert args.prompt_start < original_num_prompts, (
+    f"prompt_start={args.prompt_start} is out of range for {original_num_prompts} prompts"
+)
+if args.max_prompts > 0:
+    prompt_end = min(original_num_prompts, args.prompt_start + args.max_prompts)
+else:
+    prompt_end = original_num_prompts
+selected_indices = list(range(args.prompt_start, prompt_end))
+assert selected_indices, (
+    f"empty prompt subset: prompt_start={args.prompt_start}, "
+    f"max_prompts={args.max_prompts}, total={original_num_prompts}"
+)
+if len(selected_indices) != original_num_prompts or args.prompt_start != 0:
+    dataset = Subset(dataset, selected_indices)
 num_prompts = len(dataset)
-print(f"Number of prompts: {num_prompts}")
+print(f"Number of prompts: {num_prompts} / {original_num_prompts} (start={args.prompt_start})")
 
 if dist.is_initialized() and args.sp_size <= 1:
     # Standard DP: split prompts across ranks
@@ -168,8 +190,9 @@ trajectory_list = None
 if args.trajectory_path:
     with open(args.trajectory_path, encoding="utf-8") as _f:
         trajectory_list = [line.strip() for line in _f if line.strip()]
-    assert len(trajectory_list) >= num_prompts, (
-        f"trajectory_path has {len(trajectory_list)} lines but need >= {num_prompts} prompts"
+    assert len(trajectory_list) > selected_indices[-1], (
+        f"trajectory_path has {len(trajectory_list)} lines but selected prompt index "
+        f"{selected_indices[-1]} requires at least {selected_indices[-1] + 1} lines"
     )
 
 def encode(self, videos: torch.Tensor) -> torch.Tensor:

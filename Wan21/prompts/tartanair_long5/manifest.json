@@ -1,0 +1,55 @@
+{
+  "name": "tartanair_long5",
+  "source_dataset": "TartanAir",
+  "source_url": "https://tartanair.org/",
+  "status": "Starter benchmark using TartanAir-style scene categories and minWM trajectory strings. Raw TartanAir RGB frames and GT poses are not downloaded in this version.",
+  "num_samples": 5,
+  "num_frames": 80,
+  "format": {
+    "prompts": "Wan21/prompts/tartanair_long5/prompts.txt",
+    "trajectories": "Wan21/prompts/tartanair_long5/trajectories.txt",
+    "trajectory_convention": "minWM camera_trajectory.py string format; total operation count equals num_frames - 1 because the first pose is identity."
+  },
+  "samples": [
+    {
+      "id": "tartanair_abandoned_factory",
+      "source_env": "TartanAir style: abandoned factory",
+      "prompt": "A cinematic first-person walkthrough inside an abandoned factory, with rusted steel beams, cracked concrete floors, scattered machinery, dusty shafts of light, and a slow exploratory camera moving through the industrial interior.",
+      "trajectory": "w*16,w*16,j*16,w*16,l*15",
+      "num_frames": 80,
+      "trajectory_steps": 79
+    },
+    {
+      "id": "tartanair_neighborhood",
+      "source_env": "TartanAir style: neighborhood",
+      "prompt": "A quiet suburban neighborhood street under clear daylight, lined with small houses, trees, parked cars, fences, and sidewalks, viewed through a smooth forward-moving camera that gently shifts sideways while keeping long-term scene consistency.",
+      "trajectory": "w*16,d*16,w*16,a*16,w*15",
+      "num_frames": 80,
+      "trajectory_steps": 79
+    },
+    {
+      "id": "tartanair_oldtown",
+      "source_env": "TartanAir style: old town",
+      "prompt": "A narrow old-town stone street with warm sunlight, textured walls, arched windows, hanging signs, and distant alleys, captured as a slow camera turns into the street and continues forward through the historic scene.",
+      "trajectory": "j*16,w*16,w*16,l*16,w*15",
+      "num_frames": 80,
+      "trajectory_steps": 79
+    },
+    {
+      "id": "tartanair_hospital",
+      "source_env": "TartanAir style: hospital",
+      "prompt": "An empty hospital corridor with glossy floors, pale walls, overhead lights, medical carts, doors, and signs, filmed by a steady first-person camera that moves forward while slightly pitching up and down.",
+      "trajectory": "w*16,i*16,w*16,k*16,w*15",
+      "num_frames": 80,
+      "trajectory_steps": 79
+    },
+    {
+      "id": "tartanair_seaside",
+      "source_env": "TartanAir style: seaside / coastal town",
+      "prompt": "A bright coastal walkway beside blue water, with stone railings, distant buildings, boats, and sunlit clouds, shown through a long smooth camera move that turns gently while preserving the layout of the scene.",
+      "trajectory": "w*16,l*16,w*16,j*16,w*15",
+      "num_frames": 80,
+      "trajectory_steps": 79
+    }
+  ]
+}

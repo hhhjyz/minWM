@@ -6,6 +6,7 @@ from wan_utils.wan_wrapper import WanDiffusionWrapper, WanTextEncoder, WanVAEWra
 
 from demo_utils.memory import gpu, get_cuda_free_memory_gb, DynamicSwapInstaller, move_model_to_device_with_memory_preservation
 import tqdm
+from .debug_utils import log_cache_state, should_log_cache
 
 class CausalInferencePipeline(torch.nn.Module):
     def __init__(
@@ -40,6 +41,8 @@ class CausalInferencePipeline(torch.nn.Module):
         self.num_frame_per_block = getattr(args, "num_frame_per_block", 1)
         self.independent_first_frame = args.independent_first_frame
         self.local_attn_size = self.generator.model.local_attn_size
+        self.log_cache_state = bool(getattr(args, "log_cache_state", False))
+        self.log_cache_interval = int(getattr(args, "log_cache_interval", 1))
 
         # Latency of producing the first chunk (set by inference()).
         self.last_chunk0_latency = None
@@ -215,7 +218,7 @@ class CausalInferencePipeline(torch.nn.Module):
         all_num_frames = [self.num_frame_per_block] * num_blocks
         if self.independent_first_frame and initial_latent is None:
             all_num_frames = [1] + all_num_frames
-        for current_num_frames in tqdm.tqdm(all_num_frames):
+        for block_index, current_num_frames in enumerate(tqdm.tqdm(all_num_frames)):
             if profile:
                 block_start.record()
 
@@ -224,6 +227,18 @@ class CausalInferencePipeline(torch.nn.Module):
 
             vm_chunk = viewmats[:, current_start_frame:current_start_frame + current_num_frames] if viewmats is not None else None
             ks_chunk = Ks[:, current_start_frame:current_start_frame + current_num_frames] if Ks is not None else None
+            if should_log_cache(self.log_cache_state, block_index, self.log_cache_interval):
+                log_cache_state(
+                    tag="before_denoise",
+                    block_index=block_index,
+                    current_start_frame=current_start_frame,
+                    current_num_frames=current_num_frames,
+                    frame_seq_length=self.frame_seq_length,
+                    kv_cache=self.kv_cache1,
+                    prope_kv_cache=self.prope_kv_cache1,
+                    viewmats=vm_chunk,
+                    device=noise.device,
+                )
 
             # Step 3.1: Spatial denoising loop
             for index, current_timestep in enumerate(self.denoising_step_list):
@@ -289,6 +304,18 @@ class CausalInferencePipeline(torch.nn.Module):
                 Ks=ks_chunk,
                 prope_kv_cache=self.prope_kv_cache1,
             )
+            if should_log_cache(self.log_cache_state, block_index, self.log_cache_interval):
+                log_cache_state(
+                    tag="after_clean_update",
+                    block_index=block_index,
+                    current_start_frame=current_start_frame,
+                    current_num_frames=current_num_frames,
+                    frame_seq_length=self.frame_seq_length,
+                    kv_cache=self.kv_cache1,
+                    prope_kv_cache=self.prope_kv_cache1,
+                    viewmats=vm_chunk,
+                    device=noise.device,
+                )
 
             if profile:
                 block_end.record()

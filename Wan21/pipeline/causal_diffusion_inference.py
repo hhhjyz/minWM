@@ -6,6 +6,7 @@ import torch
 from wan.utils.fm_solvers import FlowDPMSolverMultistepScheduler, get_sampling_sigmas, retrieve_timesteps
 from wan.utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
 from wan_utils.wan_wrapper import WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper
+from .debug_utils import log_cache_state, should_log_cache
 
 
 class CausalDiffusionInferencePipeline(torch.nn.Module):
@@ -45,6 +46,8 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
         self.num_frame_per_block = getattr(args, "num_frame_per_block", 1)
         self.independent_first_frame = args.independent_first_frame
         self.local_attn_size = self.generator.model.local_attn_size
+        self.log_cache_state = bool(getattr(args, "log_cache_state", False))
+        self.log_cache_interval = int(getattr(args, "log_cache_interval", 1))
 
         # Latency of producing the first chunk (set by inference()).
         self.last_chunk0_latency = None
@@ -239,7 +242,7 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
         all_num_frames = [self.num_frame_per_block] * num_blocks
         if self.independent_first_frame and initial_latent is None:
             all_num_frames = [1] + all_num_frames
-        for current_num_frames in all_num_frames:
+        for block_index, current_num_frames in enumerate(all_num_frames):
             noisy_input = noise[
                 :, cache_start_frame - num_input_frames:cache_start_frame + current_num_frames - num_input_frames]
             latents = noisy_input
@@ -247,6 +250,18 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
             # Slice viewmats/Ks for current chunk
             vm_chunk = viewmats[:, current_start_frame:current_start_frame + current_num_frames] if viewmats is not None else None
             ks_chunk = Ks[:, current_start_frame:current_start_frame + current_num_frames] if Ks is not None else None
+            if should_log_cache(self.log_cache_state, block_index, self.log_cache_interval):
+                log_cache_state(
+                    tag="before_denoise",
+                    block_index=block_index,
+                    current_start_frame=current_start_frame,
+                    current_num_frames=current_num_frames,
+                    frame_seq_length=self.frame_seq_length,
+                    kv_cache=self.kv_cache_pos,
+                    prope_kv_cache=self.prope_kv_cache_pos,
+                    viewmats=vm_chunk,
+                    device=noise.device,
+                )
 
             # Step 3.1: Spatial denoising loop
             sample_scheduler = self._initialize_sample_scheduler(noise)
@@ -290,8 +305,6 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                     latents,
                     return_dict=False)[0]
                 latents = temp_x0
-                print(f"kv_cache['local_end_index']: {self.kv_cache_pos[0]['local_end_index']}")
-                print(f"kv_cache['global_end_index']: {self.kv_cache_pos[0]['global_end_index']}")
 
             # Step 3.2: record the model's output
             output[:, cache_start_frame:cache_start_frame + current_num_frames] = latents
@@ -326,6 +339,18 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                 Ks=ks_chunk,
                 prope_kv_cache=self.prope_kv_cache_neg
             )
+            if should_log_cache(self.log_cache_state, block_index, self.log_cache_interval):
+                log_cache_state(
+                    tag="after_clean_update",
+                    block_index=block_index,
+                    current_start_frame=current_start_frame,
+                    current_num_frames=current_num_frames,
+                    frame_seq_length=self.frame_seq_length,
+                    kv_cache=self.kv_cache_pos,
+                    prope_kv_cache=self.prope_kv_cache_pos,
+                    viewmats=vm_chunk,
+                    device=noise.device,
+                )
 
             # Step 3.4: update the start and end frame indices
             current_start_frame += current_num_frames
