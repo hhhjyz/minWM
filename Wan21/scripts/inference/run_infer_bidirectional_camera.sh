@@ -16,9 +16,12 @@ SP_SIZE="${SP_SIZE:-1}"
 # ===== Camera Trajectory =====
 TRAJECTORY="${TRAJECTORY:-w*19}"
 TRAJECTORY_PATH="${TRAJECTORY_PATH:-}"
+TRAJECTORY_POSE_PATH="${TRAJECTORY_POSE_PATH:-}"
 
 # Build trajectory argument
-if [ -n "$TRAJECTORY_PATH" ]; then
+if [ -n "$TRAJECTORY_POSE_PATH" ]; then
+  TRAJ_ARGS="--trajectory_pose_path $TRAJECTORY_POSE_PATH"
+elif [ -n "$TRAJECTORY_PATH" ]; then
   TRAJ_ARGS="--trajectory_path $TRAJECTORY_PATH"
 else
   TRAJ_ARGS="--trajectory $TRAJECTORY"
@@ -34,6 +37,7 @@ echo "=== Inference: Bidirectional Camera Control ==="
 echo "  Config:     $CONFIG_PATH"
 echo "  Checkpoint: $CHECKPOINT_PATH"
 echo "  Output:     $OUTPUT_FOLDER"
+echo "  Pose path:  ${TRAJECTORY_POSE_PATH:-<trajectory-string-mode>}"
 
 export SP_SIZE=$SP_SIZE
 torchrun \

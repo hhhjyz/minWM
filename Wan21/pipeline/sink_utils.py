@@ -1,4 +1,10 @@
-"""Utilities for sink-frame KV cache experiments."""
+"""Utilities for sink-frame KV cache experiments.
+
+Periodic sink v0 directly copies already-encoded RoPE/PRoPE KV tensors into the
+sink slots. It does not recompute RoPE or PRoPE for the new cache positions.
+This is useful as a low-cost ablation, but it is not a geometrically strict
+position-corrected replay mechanism.
+"""
 
 
 def get_model_sink_size_frames(generator) -> int:
@@ -17,6 +23,12 @@ def normalize_sink_strategy(strategy: str) -> str:
 
 
 def copy_latest_tokens_to_sink(cache_list, sink_tokens: int, latest_tokens: int) -> int:
+    """Copy the newest cached K/V tokens into the leading sink slots.
+
+    Important: this copies the cached tensors as-is. For PRoPE caches, the
+    tensors have already been transformed with the source block's camera pose.
+    No RoPE/PRoPE re-encoding is performed after moving them to the sink area.
+    """
     if not cache_list or sink_tokens <= 0 or latest_tokens <= 0:
         return 0
 
@@ -57,6 +69,9 @@ def maybe_update_periodic_sink(
 
     sink_tokens = sink_size_frames * frame_seq_length
     latest_tokens = current_num_frames * frame_seq_length
+    # v0 approximation: both normal KV and PRoPE KV are copied as encoded memory.
+    # Future retrieval-quality implementations should store raw K/V + pose/frame
+    # metadata and apply RoPE/PRoPE correction when replaying memory.
     copied = copy_latest_tokens_to_sink(kv_cache, sink_tokens, latest_tokens)
     prope_copied = copy_latest_tokens_to_sink(prope_kv_cache, sink_tokens, latest_tokens)
     print(

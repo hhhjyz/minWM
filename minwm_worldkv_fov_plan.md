@@ -96,9 +96,51 @@ TRAJECTORY_PATH="../Wan21/prompts/trajectories.txt" \
 bash Wan21/scripts/inference/run_infer_causal_camera.sh
 ```
 
-### 小样本 smoke test
+### ViewBench small12 小样本 smoke test
 
-完整 `demos.txt` 当前有 30 条 prompt，逐条全部推理会很慢。为了研究 sink frame 和 KV cache 对长视频生成的影响，默认使用 `tartanair_long5_120` 小数据集：每次跑 5 个视频，每个视频默认 120 帧。
+完整 `demos.txt` 当前有 30 条 prompt，逐条全部推理会很慢。为了研究 sink frame、KV cache、WorldKV/FOV retrieval 对长视频 loop closure 的影响，默认改为使用 ViewBench public split 构造 `viewbench_small12`：
+
+- 4 条纯旋转。
+- 4 条多轴旋转。
+- 4 条旋转+平移。
+- 每条使用 ViewBench 原始 per-frame pose，保存为 minWM 可直接读取的 `.npz`。
+
+先下载并解压 ViewBench：
+
+```bash
+cd /pool/hdd/home/hhhjyz/research
+
+modelscope download \
+  --dataset JEdward/viewbench-dataset \
+  --local_dir ./datasets/ViewBench-v1
+
+mkdir -p ./datasets/ViewBench4Training
+for shard in ./datasets/ViewBench-v1/pure_rotation_*.tar.zst ./datasets/ViewBench-v1/rotation_translation_*.tar.zst; do
+  tar --zstd -xf "$shard" -C ./datasets/ViewBench4Training
+done
+```
+
+构造 minWM 小测试集：
+
+```bash
+cd /pool/hdd/home/hhhjyz/research/minWM
+
+python Wan21/scripts/data_preprocessing/build_viewbench_small.py \
+  --viewbench-root /pool/hdd/home/hhhjyz/research/datasets/ViewBench4Training \
+  --output-dir Wan21/prompts/viewbench_small12 \
+  --max-frames 360
+```
+
+生成文件：
+
+```text
+Wan21/prompts/viewbench_small12/prompts.txt
+Wan21/prompts/viewbench_small12/trajectory_pose_paths.txt
+Wan21/prompts/viewbench_small12/poses/*.npz
+Wan21/prompts/viewbench_small12/manifest.json
+```
+
+运行 smoke test：
 
 ```bash
 cd /pool/hdd/home/hhhjyz/research/minWM
@@ -114,22 +156,22 @@ bash Wan21/scripts/inference/run_smoke_causal_camera.sh
 cd /pool/hdd/home/hhhjyz/research/minWM
 
 MAX_PROMPTS=5 \
-NUM_OUTPUT_FRAMES=80 \
-OUTPUT_FOLDER=./outputs/profile_tartanair_long5_120 \
+NUM_OUTPUT_FRAMES=180 \
+OUTPUT_FOLDER=./outputs/profile_viewbench_small12 \
 bash Wan21/scripts/inference/run_profiled_smoke_causal_camera.sh
 ```
 
 生成内容会保存在：
 
 ```text
-./outputs/profile_tartanair_long5_120/profile/
+./outputs/profile_viewbench_small12/profile/
 ```
 
 主要文件：
 
 - `inference.log`：完整推理日志。
 - `inference_times.csv`：每个视频的耗时明细。
-- `profile_summary.json` / `profile_summary.txt`：平均每视频耗时、平均生成耗时、写视频耗时、wall time 和估计 FPS。
+- `profile_summary.json` / `profile_summary.txt`：平均每视频耗时、平均生成耗时、写视频耗时、wall time、last-chunk FPS 和峰值显存。
 - `video_total_seconds.png`：每个视频总耗时图。
 - `video_stage_seconds.png`：每个视频的 generation / postprocess / write video 分段耗时图。
 
@@ -146,24 +188,24 @@ bash Wan21/scripts/inference/run_profiled_smoke_causal_camera.sh
 ```bash
 PROMPT_START=0 \
 MAX_PROMPTS=2 \
-NUM_OUTPUT_FRAMES=120 \
-OUTPUT_FOLDER=./outputs/smoke_start0_n2_120 \
+NUM_OUTPUT_FRAMES=180 \
+OUTPUT_FOLDER=./outputs/viewbench_start0_n2_180 \
 bash Wan21/scripts/inference/run_smoke_causal_camera.sh
 ```
 
 参数含义：
 
-- `DATA_PATH=Wan21/prompts/tartanair_long5_120/prompts.txt`：默认使用 5 条 TartanAir 风格长视频 prompt。
-- `TRAJECTORY_PATH=Wan21/prompts/tartanair_long5_120/trajectories.txt`：默认使用与 prompt 对齐的长 camera trajectory。
-- `MAX_PROMPTS=5`：默认跑 5 条 prompt。
+- `DATA_PATH=Wan21/prompts/viewbench_small12/prompts.txt`：默认使用 12 条 ViewBench 小样本 prompt。
+- `TRAJECTORY_POSE_PATH=Wan21/prompts/viewbench_small12/trajectory_pose_paths.txt`：默认使用与 prompt 对齐的 ViewBench pose `.npz`。
+- `MAX_PROMPTS=1`：默认只跑 1 条 prompt，避免第一次 smoke test 太慢；正式小规模比较建议设为 12。
 - `PROMPT_START=0`：从第 0 条 prompt 开始；例如设为 `5` 就跑第 5 条开始的样本。
-- `NUM_OUTPUT_FRAMES=120`：默认生成更长的视频，方便观察长时一致性。causal camera 默认 `num_frame_per_block=4`，建议使用 4 的倍数，例如 80、120、160。
-- `TRAJECTORY_PATH` 仍然使用完整 trajectory 文件；代码会按原始 prompt 下标自动取对应行。
+- `NUM_OUTPUT_FRAMES=180`：默认生成 180 帧，方便观察长时一致性。causal camera 默认 `num_frame_per_block=4`，建议使用 4 的倍数；如果设为 `0` 或负数，会使用每条 pose `.npz` 的原生长度。
+- `TRAJECTORY_POSE_PATH` 仍然使用完整 pose list 文件；代码会按原始 prompt 下标自动取对应行。
 
-`tartanair_long5` 的构造脚本和说明：
+ViewBench small12 的构造脚本和说明：
 
-- `minWM/Wan21/scripts/data_preprocessing/build_tartanair_long5.py`
-- `minWM/Wan21/prompts/tartanair_long5_120/README.md`
+- `minWM/Wan21/scripts/data_preprocessing/build_viewbench_small.py`
+- `minWM/Wan21/prompts/viewbench_small12/README.md`
 
 如果只想临时绕过代码参数，也可以手动切小文件：
 
@@ -176,9 +218,28 @@ head -n 1 Wan21/prompts/trajectories.txt > Wan21/prompts/trajectories_1.txt
 
 - 峰值显存。
 - 每个 prompt 的推理时间。
+- last-chunk FPS。
 - 输出视频质量。
 - camera trajectory 是否明显生效。
 - 是否有依赖、checkpoint 路径或权重加载问题。
+
+### ViewBench small12 评测
+
+推理完成后，使用轻量评测脚本计算 loop-closure 帧对的一致性：
+
+```bash
+python Wan21/scripts/evaluation/evaluate_viewbench_small.py \
+  --manifest Wan21/prompts/viewbench_small12/manifest.json \
+  --timing-csv ./outputs/profile_viewbench_small12/inference_times.csv \
+  --output-dir ./outputs/profile_viewbench_small12/eval
+```
+
+输出：
+
+- `viewbench_metrics.csv`：每个视频的 PSNR、SSIM、LPIPS、last-chunk FPS、峰值显存。
+- `viewbench_metrics.json`：平均指标和评测说明。
+
+LPIPS 依赖 `lpips` 包；如果当前环境没有安装，脚本会跳过 LPIPS 并保留 PSNR/SSIM/FPS。FID 暂不在轻量评测中计算，因为没有明确参考分布时，FID 对当前生成式 loop-closure 对比的解释性较弱。
 
 ### 成功标准
 
@@ -310,19 +371,19 @@ sink_size = 4
 cd /pool/hdd/home/hhhjyz/research/minWM
 
 MAX_PROMPTS=5 \
-NUM_OUTPUT_FRAMES=80 \
+NUM_OUTPUT_FRAMES=180 \
 SINK_SIZE=4 \
 SINK_UPDATE_INTERVAL=4 \
-RUN_PREFIX=sink_ablation_tartanair120 \
+RUN_PREFIX=sink_ablation_viewbench180 \
 bash Wan21/scripts/inference/run_sink_ablation_causal_camera.sh
 ```
 
 输出目录示例：
 
 ```text
-outputs/sink_ablation_tartanair120_baseline_0_1_120/
-outputs/sink_ablation_tartanair120_fixed_sink4_0_1_120/
-outputs/sink_ablation_tartanair120_periodic_sink4_int4_0_1_120/
+outputs/sink_ablation_viewbench180_baseline_0_5_180/
+outputs/sink_ablation_viewbench180_fixed_sink4_0_5_180/
+outputs/sink_ablation_viewbench180_periodic_sink4_int4_0_5_180/
 ```
 
 每个目录下都会保留：
@@ -371,6 +432,15 @@ minWM 的 camera PRoPE 有独立的 `prope_kv_cache`。任何 sink 更新都必�
 - `prope_kv_cache_pos` / `prope_kv_cache_neg`
 - DMD/ODE 单条件路径中的 `kv_cache1` / `prope_kv_cache1`
 
+当前实现是 `periodic sink v0`：直接复制已经编码好的 RoPE/PRoPE KV 到 sink 区域，不重新计算 RoPE 或 PRoPE 位置编码。这适合作为低成本 ablation，用来判断“定期刷新 sink memory”是否有实验价值，但它不是严格的位置校正或几何一致 replay。
+
+后续做 WorldKV/FOV retrieval 级别的正式实现时，应升级为：
+
+- 额外保存 raw K/V；
+- 记录 frame id、block id、viewmats/Ks；
+- replay 或 retrieval 时做 RoPE/PRoPE correction；
+- 明确区分“memory slot 位置”和“原始相机/时间位置”。
+
 ### 实现提示
 
 causal attention 的滚动逻辑已经会保护前面的 `sink_tokens`：
@@ -394,56 +464,125 @@ model_kwargs:
 - periodic sink update 能完整跑完推理。
 - 可以和原始 baseline 使用同一 prompt、trajectory、seed 做视频对比。
 
-## 里程碑 3：在 minWM 中建立 KV bank
+## 里程碑 3：在 minWM 中建立 KV bank（已完成）
 
 ### 目标
 
-先只保存历史 clean-block KV，不进行 retrieval。这样可以单独验证 bank 的存储逻辑和显存/内存开销。
+保存每个生成 block 在 clean context pass 后的历史 KV，但暂时不把 bank 接入 attention。这样可以独立验证存储逻辑、normal/PRoPE 对齐和内存开销，并保证关闭 retrieval 时不改变生成结果。
 
-### 存储时机
+### 当前实现
 
-每个 block 生成后：
+核心实现：
+
+- `Wan21/pipeline/kv_bank.py`
+- `Wan21/pipeline/causal_inference.py`：DMD/ODE 单条件路径，保存 `main` 分支。
+- `Wan21/pipeline/causal_diffusion_inference.py`：CFG diffusion 路径，分别保存 `cond` 和 `uncond` 分支。
+
+每个 block 在 clean context pass 后执行：
 
 ```text
 denoise 当前 block
-把输出写入 output
-运行 clean context pass 更新 KV
-抽取当前 block 的 clean KV
-append 到 KV bank
+写入 output
+clean context pass 覆盖 cache 中当前 block 的 KV
+从每层 cache 末尾抽取当前 block token
+复制到 CPU/GPU KV bank
+可选 periodic sink update
 ```
 
-### bank 内容
+每个 block 保存：
 
-每一层保存：
+- 每层 normal K/V。
+- 每层 PRoPE K/V；没有 camera pose 时允许为空。
+- `block_id`、`frame_start`、`frame_end`、`token_count`。
+- 当前 block 的 `viewmats` 和 `Ks` CPU 副本。
+- 平移幅度和旋转角 pose summary。
+- block 与 bank 的精确存储字节数。
 
-- normal K
-- normal V
-- PRoPE K
-- PRoPE V
+后续 retrieval 可以通过：
 
-每个 block 额外保存元信息：
+```python
+pipeline.kv_bank.get_layer(block_index, layer_index, branch="main")
+```
 
-- block id
-- frame start/end
-- viewmats/Ks slice
-- 可选的 pose summary，供检索使用
+读取指定 block/layer/branch 的 KV。
 
-### 设备策略
-
-优先使用 CPU bank，保护 A100 40G 显存：
+### 配置参数
 
 ```text
-bank tensor 存在 CPU
-只有被检索到时才搬到 GPU
+KV_BANK_ENABLE=0             默认关闭
+KV_BANK_DEVICE=cpu           默认使用 CPU 主存
+KV_BANK_MAX_BLOCKS=0         0 表示不限制；正数表示 FIFO 保留上限
+KV_BANK_LOG_INTERVAL=1       每 N 个 block 打印一次 bank 状态
+KV_BANK_WARN_MEMORY_GB=16    预计存储超过该值时打印警告
 ```
+
+对应 Python 参数：
+
+```text
+--kv_bank_enable
+--kv_bank_device {cpu,cuda}
+--kv_bank_max_blocks N
+--kv_bank_log_interval N
+--kv_bank_warn_memory_gb N
+```
+
+### 安全 smoke test
+
+第一轮建议只保留 2 个 block：
+
+```bash
+cd /pool/hdd/home/hhhjyz/research/minWM
+
+bash Wan21/scripts/inference/run_kv_bank_smoke_causal_camera.sh
+```
+
+等价参数：
+
+```bash
+MAX_PROMPTS=1 \
+NUM_OUTPUT_FRAMES=20 \
+KV_BANK_ENABLE=1 \
+KV_BANK_DEVICE=cpu \
+KV_BANK_MAX_BLOCKS=2 \
+OUTPUT_FOLDER=./outputs/kv_bank_smoke \
+bash Wan21/scripts/inference/run_profiled_smoke_causal_camera.sh
+```
+
+`inference_times.csv/json` 和 `profile_summary.json/txt` 新增：
+
+- `kv_bank_blocks`
+- `kv_bank_evicted_blocks`
+- `kv_bank_total_bytes`
+- `kv_bank_total_gb`
+- `kv_bank_branches`
+
+### 内存风险
+
+未压缩 KV bank 非常大。Wan21 camera DMD 的一个 4-frame block 会保存 30 层 normal K/V 和 PRoPE K/V；diffusion 还会同时保存 cond/uncond 两套。运行 180 帧且 `KV_BANK_MAX_BLOCKS=0` 时可能消耗数十到上百 GB 主存。
+
+因此当前建议：
+
+- 功能验证使用 `KV_BANK_MAX_BLOCKS=1` 或 `2`。
+- 正式验证完整增长前先观察日志中的 `block_gb` 和 `projected_gb`。
+- A100 40G 上默认使用 CPU bank，不使用 GPU bank。
+- 后续里程碑 6 加入 compression 后，再进行完整长视频 bank 实验。
+
+### 当前限制
+
+- bank 保存的是已经应用 RoPE/PRoPE 的 clean KV，不是 raw K/V。
+- bank 当前不参与 attention，因此不会改善或损害生成画面，只增加复制耗时和内存占用。
+- sequence parallel 模式下，每个 rank 保存本 rank 的 head shard；日志中的内存是单 rank 数值。
+- `KV_BANK_MAX_BLOCKS>0` 时使用 FIFO 淘汰最旧 block。
 
 ### 成功标准
 
-- 每生成一个 block，bank 长度增加 1。
-- retrieval 关闭时，bank 存储不影响生成结果。
-- CPU 内存增长可预测。
+- `KV_BANK_ENABLE=0` 时不复制任何 bank tensor。
+- 不设置 block 上限时，每生成一个 block，bank 长度增加 1。
+- DMD 的 `main` 以及 diffusion 的 `cond/uncond` 都能保存 normal/PRoPE KV。
+- bank 存储不进入 attention，不改变输出 tensor 形状和 cache index。
+- CPU 内存增长可以通过日志和 timing 文件解释。
 
-## 里程碑 4：加入 WorldKV 风格 retrieval window
+## 里程碑 4：加入 WorldKV 风格 retrieval window（第一版已完成）
 
 ### 目标
 
@@ -453,12 +592,27 @@ bank tensor 存在 CPU
 [sink | retrieved | recent]
 ```
 
-### 第一版范围
+### 第一版实现范围
 
-- 不做 compression。
-- 只支持 pose retrieval。
-- retrieved block 数固定。
-- bank 存在 CPU，检索时搬到 GPU。
+- 默认关闭；通过 `--retrieval_enable` 或 `RETRIEVAL_ENABLE=1` 打开。
+- 使用已有 KV bank 保存 clean context pass 后的 block KV。
+- attention window 由原始 local recent window 改为可选的：
+
+```text
+[sink | retrieved | recent]
+```
+
+- DMD/ODE 路径使用 `main` 分支。
+- diffusion CFG 路径分别使用 `cond` 和 `uncond` 分支。
+- normal KV 和 PRoPE KV 都会构造 retrieval payload；如果没有 PRoPE payload，则 PRoPE 路径自动退回原 local window。
+- KV bank 默认 CPU 存储，检索时按需搬到当前推理 device。
+- 可选支持 WorldKV 风格 normal KV time-axis RoPE rebasing：
+
+```bash
+RETRIEVAL_ROPE_CORRECTION=1
+```
+
+该开关只修正 normal RoPE K；PRoPE KV 的几何位置重映射仍作为后续风险项保留。
 
 ### 代码切入点
 
@@ -482,13 +636,28 @@ attention(roped_query, k_cache, v_cache)
 
 同样结构也要用于 `prope_kv_cache`。
 
+当前代码位置：
+
+- `Wan21/pipeline/kv_bank.py`
+  - `KVBank.select_retrieval_blocks(...)`
+  - `KVBank.get_retrieval_payloads(...)`
+- `Wan21/pipeline/causal_inference.py`
+  - DMD/ODE `main` 分支 retrieval payload 构造。
+- `Wan21/pipeline/causal_diffusion_inference.py`
+  - diffusion `cond/uncond` 分支 retrieval payload 构造。
+- `Wan21/wan/modules/causal_model.py`
+  - `_compose_attention_window(...)`
+  - `CausalWanSelfAttention.forward(..., retrieval_kv=...)`
+- `Wan21/wan_utils/wan_wrapper.py`
+  - 将 `retrieval_kv` 透传到 causal model。
+
 ### 成功标准
 
 - retrieval 可以通过配置启用/关闭。
 - retrieved block 数为 0 时，行为应退化为原始 local window 或 sink-only。
 - retrieved window token 数稳定。
 
-## 里程碑 5：比较不同检索算法
+## 里程碑 5：比较不同检索算法（第一版已完成）
 
 ### 目标
 
@@ -497,7 +666,8 @@ attention(roped_query, k_cache, v_cache)
 ```text
 recent_only
 pose
-fov
+worldkv_fov
+hy_fov
 hybrid
 ```
 
@@ -517,13 +687,20 @@ translation distance + rotation geodesic distance
 
 #### FOV Retrieval
 
-参考 HY-WorldPlay：
+当前实现了两种 FOV 检索：
+
+1. `worldkv_fov`
+   - 参考 WorldKV 的 C2W deterministic probe points。
+   - 使用当前 block 和历史 block 的中间帧估计 FOV overlap。
+2. `hy_fov`
+   - 参考 HY-WorldPlay 的 W2C angular FOV overlap。
+   - 使用 pitch/yaw + spherical probe 判断视锥重叠。
 
 ```text
 distance = 1 - FOV_overlap(current block, historical block)
 ```
 
-注意：使用 minWM 原生 pose convention，不要直接复制其他仓库里的 W2C/C2W 转换。
+注意：minWM 中 `viewmats` 按 W2C 存储；WorldKV-style FOV 会显式转为 C2W，HY-style FOV 保留 W2C angular convention。
 
 #### Hybrid Retrieval
 
@@ -543,13 +720,41 @@ distance = (1 - alpha) * normalized_pose_distance + alpha * fov_distance
 - retrieval 额外耗时
 - 峰值显存
 
+第一版目前已经支持 metric 切换，并加入了 block-level retrieval diagnostics。每个视频推理结束后，会在 `OUTPUT_FOLDER` 下追加：
+
+```text
+retrieval_events.csv
+retrieval_events.jsonl
+```
+
+如果使用 profiled 入口，这两个文件也会复制到：
+
+```text
+OUTPUT_FOLDER/profile/retrieval_events.csv
+OUTPUT_FOLDER/profile/retrieval_events.jsonl
+```
+
+主要字段：
+
+- `sample_order` / `prompt_index`
+- `branch`：DMD 为 `main`，diffusion 为 `cond` 或 `uncond`
+- `current_frame_start` / `current_num_frames`
+- `metric`
+- `candidate_block_ids`
+- `selected_block_ids`
+- `selected_frame_starts`
+- `distances`
+- `retrieved_tokens_per_layer`
+- `selection_seconds`
+- `payload_seconds`
+
 ### 成功标准
 
 - 不同 metric 能够选择不同的历史 block。
 - 同一 seed 下检索结果可复现。
 - 日志足够解释视频中的回环、一致性或漂移现象。
 
-## 里程碑 6：加入 KV compression
+## 里程碑 6：加入 KV compression（第一版已完成）
 
 ### 目标
 
@@ -571,13 +776,78 @@ compression 必须一致应用到：
 - normal KV
 - PRoPE KV
 
-两条分支最好共享同一组 token indices，确保 ordinary attention 和 PRoPE attention 看到的是对齐后的 token 子集。
+当前第一版会对 normal KV 和 PRoPE KV 应用相同的 anchor/novelty 规则，但每条张量路径各自根据自己的 K 计算 token novelty。后续如果要更严格对齐 ordinary attention 和 PRoPE attention，应改成共享同一组 token indices。
+
+支持两种模式：
+
+- store-time compression：`--kv_compression_enable --kv_compression_at_store`
+- retrieval-time compression：`--kv_compression_enable` 且不设置 `--kv_compression_at_store`
+
+相关参数：
+
+```bash
+--kv_compression_keep_ratio 0.5
+--kv_compression_anchor_rotate
+--kv_compression_pooled
+```
 
 ### 成功标准
 
 - compression 改变 token 数，但不改变 batch/head/dim 维度。
 - compression 可以关闭。
 - 分别测试 store-time compression 和 retrieval-time compression。
+
+### 当前 smoke 命令
+
+```bash
+cd /pool/hdd/home/hhhjyz/research/minWM
+
+RETRIEVAL_ENABLE=1 \
+RETRIEVAL_METRIC=pose \
+RETRIEVAL_FRAMES=4 \
+RETRIEVAL_RECENT_FRAMES=4 \
+RETRIEVAL_ROPE_CORRECTION=1 \
+KV_BANK_DEVICE=cpu \
+KV_BANK_MAX_BLOCKS=2 \
+MAX_PROMPTS=1 \
+NUM_OUTPUT_FRAMES=20 \
+bash Wan21/scripts/inference/run_smoke_causal_camera.sh
+```
+
+测试 WorldKV FOV：
+
+```bash
+RETRIEVAL_ENABLE=1 \
+RETRIEVAL_METRIC=worldkv_fov \
+RETRIEVAL_FRAMES=4 \
+RETRIEVAL_FOV_SAMPLES=2048 \
+KV_BANK_MAX_BLOCKS=2 \
+bash Wan21/scripts/inference/run_smoke_causal_camera.sh
+```
+
+测试 HY-WorldPlay FOV：
+
+```bash
+RETRIEVAL_ENABLE=1 \
+RETRIEVAL_METRIC=hy_fov \
+RETRIEVAL_FRAMES=4 \
+RETRIEVAL_FOV_SAMPLES=2048 \
+KV_BANK_MAX_BLOCKS=2 \
+bash Wan21/scripts/inference/run_smoke_causal_camera.sh
+```
+
+测试 store-time compression：
+
+```bash
+RETRIEVAL_ENABLE=1 \
+RETRIEVAL_METRIC=pose \
+RETRIEVAL_FRAMES=4 \
+KV_COMPRESSION_ENABLE=1 \
+KV_COMPRESSION_AT_STORE=1 \
+KV_COMPRESSION_KEEP_RATIO=0.5 \
+KV_BANK_MAX_BLOCKS=2 \
+bash Wan21/scripts/inference/run_smoke_causal_camera.sh
+```
 
 ## 里程碑 7：基于相机运动动态调整剪枝率
 
@@ -676,7 +946,7 @@ minWM 同时有 normal KV 和 PRoPE KV。任何 sink、retrieval、compression �
 
 retrieved KV 是在历史时间位置编码出来的。如果把它插入到 recent 前面，可能需要类似 WorldKV 的 RoPE correction。
 
-早期 smoke test 可以先不做 RoPE correction，但正式对比必须补上。
+当前已经支持可选 normal KV RoPE rebasing：`RETRIEVAL_ROPE_CORRECTION=1`。PRoPE KV 仍沿用历史 block 存储时的位置编码，尚未做严格几何 rebasing。如果 retrieval 带来画面跳变或 camera-aware 几何不稳定，优先排查 PRoPE retrieved KV 的位置一致性。
 
 ### Token 数假设
 
@@ -699,6 +969,19 @@ compression 会改变 token 数。所有默认假设 `chunk_size * frame_seq_len
 5. 在写 retrieval 前，单独设计 KV bank API。
 
 ## 维护日志
+
+- 2026-07-16
+  - 完成里程碑 4 第一版：在 minWM causal attention 中加入 WorldKV 风格 `[sink | retrieved | recent]` retrieval window。
+  - 完成里程碑 5 第一版：新增 `pose`、`worldkv_fov`、`hy_fov`、`hybrid`、`recent_only` 检索 metric。
+  - 完成里程碑 6 第一版：新增 WorldKV-style anchor + novelty KV compression，支持 store-time 和 retrieval-time 两种模式。
+  - 新增 `retrieval_rope_correction` / `RETRIEVAL_ROPE_CORRECTION`，支持 WorldKV-style normal KV time-axis RoPE rebasing。
+  - 新增 `Wan21/pipeline/retrieval_utils.py`，集中实现 WorldKV 和 HY-WorldPlay 风格的检索距离。
+  - 新增 `retrieval_events.csv/jsonl`，记录 block-level candidate/selected block、distance、retrieved token 数和检索耗时。
+  - 已用 `ling` 环境完成 py_compile、bash 语法检查和 fake-cache 单元验证。
+  - 完成里程碑 3：新增 chunk-level KV bank。
+  - DMD/ODE 保存 main 分支，diffusion 保存 cond/uncond 分支。
+  - 支持 CPU/GPU 存储、FIFO block 上限、内存预测警告和 timing 汇总。
+  - 新增 `run_kv_bank_smoke_causal_camera.sh` 安全验证入口。
 
 - 2026-07-14
   - 创建路线规划。

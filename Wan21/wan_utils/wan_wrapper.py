@@ -232,7 +232,8 @@ class WanDiffusionWrapper(torch.nn.Module):
         cache_start: Optional[int] = None,
         viewmats: Optional[torch.Tensor] = None,
         Ks: Optional[torch.Tensor] = None,
-        prope_kv_cache: Optional[List[dict]] = None
+        prope_kv_cache: Optional[List[dict]] = None,
+        retrieval_kv: Optional[List[dict]] = None,
     ) -> torch.Tensor:
         prompt_embeds = conditional_dict["prompt_embeds"]
 
@@ -261,7 +262,8 @@ class WanDiffusionWrapper(torch.nn.Module):
                 cache_start=cache_start,
                 viewmats=viewmats,
                 Ks=Ks,
-                prope_kv_cache=prope_kv_cache
+                prope_kv_cache=prope_kv_cache,
+                retrieval_kv=retrieval_kv,
             ).permute(0, 2, 1, 3, 4)
         else:
             if clean_x is not None:

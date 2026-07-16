@@ -96,6 +96,95 @@ def causal_rope_apply(x, grid_sizes, freqs, start_frame=0):
     return torch.stack(output).type_as(x)
 
 
+def _rope_time_delta_mul_(k_chunk, freqs, delta_frames: int) -> None:
+    """In-place time-axis RoPE shift for already-roped keys."""
+    if delta_frames == 0:
+        return
+
+    b, l, h, d = k_chunk.shape
+    if d % 2 != 0:
+        return
+    c = d // 2
+    t_c = c - 2 * (c // 3)
+    h_c = c // 3
+    w_c = c // 3
+    freqs_t, _, _ = freqs.split([t_c, h_c, w_c], dim=1)
+
+    shift = min(abs(int(delta_frames)), freqs_t.shape[0] - 1)
+    mult = freqs_t[shift] if delta_frames >= 0 else torch.conj(freqs_t[shift])
+    mult = mult.view(1, 1, 1, t_c)
+
+    time_ri = k_chunk[..., : 2 * t_c]
+    time_cx = torch.view_as_complex(time_ri.to(torch.float64).reshape(-1, t_c, 2))
+    time_cx = time_cx * mult.to(time_cx.dtype)
+    time_ri_new = torch.view_as_real(time_cx).reshape(b, l, h, t_c, 2).flatten(-2)
+    time_ri.copy_(time_ri_new.to(time_ri.dtype))
+
+
+def _compose_attention_window(
+    kv_cache,
+    local_end_index: int,
+    max_attention_size: int,
+    sink_tokens: int,
+    retrieval_kv=None,
+    *,
+    retrieval_key: str = "k",
+    retrieval_value: str = "v",
+    dtype=None,
+    device=None,
+    freqs=None,
+    current_end: int | None = None,
+    frame_seq_length: int | None = None,
+):
+    if retrieval_kv is None or retrieval_key not in retrieval_kv or retrieval_value not in retrieval_kv:
+        start = max(0, local_end_index - max_attention_size)
+        return kv_cache["k"][:, start:local_end_index], kv_cache["v"][:, start:local_end_index]
+
+    sink_end = min(max(0, int(sink_tokens)), local_end_index)
+    sink_k = kv_cache["k"][:, :sink_end]
+    sink_v = kv_cache["v"][:, :sink_end]
+    retr_k = retrieval_kv[retrieval_key]
+    retr_v = retrieval_kv[retrieval_value]
+    if device is not None:
+        retr_k = retr_k.to(device=device)
+        retr_v = retr_v.to(device=device)
+    if dtype is not None:
+        retr_k = retr_k.to(dtype=dtype)
+        retr_v = retr_v.to(dtype=dtype)
+
+    retr_tokens = int(retr_k.shape[1])
+    recent_budget = max(0, int(max_attention_size) - sink_end - retr_tokens)
+    recent_start = max(sink_end, local_end_index - recent_budget)
+    recent_k = kv_cache["k"][:, recent_start:local_end_index]
+    recent_v = kv_cache["v"][:, recent_start:local_end_index]
+
+    if (
+            retrieval_key == "k"
+            and retrieval_kv.get("rope_correction", False)
+            and "src_frame_ids" in retrieval_kv
+            and freqs is not None
+            and current_end is not None
+            and frame_seq_length):
+        retr_k = retr_k.clone()
+        current_end_frame = int(current_end) // int(frame_seq_length)
+        recent_len_frames = recent_k.shape[1] // int(frame_seq_length)
+        recent_start_frame = current_end_frame - recent_len_frames
+        src_frame_ids = list(retrieval_kv["src_frame_ids"])
+        if src_frame_ids:
+            chunk_tokens = retr_tokens // len(src_frame_ids)
+            chunk_size_frames = int(retrieval_kv.get("compress_chunk_size", 0)) or max(
+                1, chunk_tokens // int(frame_seq_length)
+            )
+            for chunk_index, src_frame_id in enumerate(src_frame_ids):
+                virtual_frame_id = recent_start_frame - (len(src_frame_ids) - chunk_index) * chunk_size_frames
+                delta = int(virtual_frame_id) - int(src_frame_id)
+                if delta != 0:
+                    token_start = chunk_index * chunk_tokens
+                    token_end = token_start + chunk_tokens
+                    _rope_time_delta_mul_(retr_k[:, token_start:token_end], freqs, delta)
+    return torch.cat([sink_k, retr_k, recent_k], dim=1), torch.cat([sink_v, retr_v, recent_v], dim=1)
+
+
 class CausalWanSelfAttention(nn.Module):
 
     def __init__(self,
@@ -137,6 +226,7 @@ class CausalWanSelfAttention(nn.Module):
         viewmats=None,
         Ks=None,
         prope_kv_cache=None,
+        retrieval_kv=None,
     ):
         r"""
         Args:
@@ -364,8 +454,18 @@ class CausalWanSelfAttention(nn.Module):
                 kv_cache["v"][:, local_start_index:local_end_index] = v
             x = attention(
                 roped_query,
-                kv_cache["k"][:, max(0, local_end_index - self.max_attention_size):local_end_index],
-                kv_cache["v"][:, max(0, local_end_index - self.max_attention_size):local_end_index]
+                *_compose_attention_window(
+                    kv_cache,
+                    local_end_index,
+                    self.max_attention_size,
+                    sink_tokens,
+                    retrieval_kv,
+                    dtype=roped_query.dtype,
+                    device=roped_query.device,
+                    freqs=freqs,
+                    current_end=current_end,
+                    frame_seq_length=frame_seqlen,
+                )
             )
             kv_cache["global_end_index"].fill_(current_end)
             kv_cache["local_end_index"].fill_(local_end_index)
@@ -397,8 +497,17 @@ class CausalWanSelfAttention(nn.Module):
 
                 x_prope = attention(
                     q_p,
-                    prope_kv_cache["k"][:, max(0, p_local_end - self.max_attention_size):p_local_end],
-                    prope_kv_cache["v"][:, max(0, p_local_end - self.max_attention_size):p_local_end]
+                    *_compose_attention_window(
+                        prope_kv_cache,
+                        p_local_end,
+                        self.max_attention_size,
+                        sink_tokens,
+                        retrieval_kv,
+                        retrieval_key="prope_k",
+                        retrieval_value="prope_v",
+                        dtype=q_p.dtype,
+                        device=q_p.device,
+                    )
                 )
                 prope_kv_cache["global_end_index"].fill_(current_end)
                 prope_kv_cache["local_end_index"].fill_(p_local_end)
@@ -490,7 +599,8 @@ class CausalWanAttentionBlock(nn.Module):
         cache_start=None,
         viewmats=None,
         Ks=None,
-        prope_kv_cache=None
+        prope_kv_cache=None,
+        retrieval_kv=None,
     ):
         r"""
         Args:
@@ -513,7 +623,8 @@ class CausalWanAttentionBlock(nn.Module):
                 self.norm1(x) * (1 + e[1].squeeze(2)) + e[0].squeeze(2),
                 seq_lens, grid_sizes,
                 freqs, block_mask, kv_cache, current_start, cache_start,
-                viewmats=viewmats, Ks=Ks, prope_kv_cache=prope_kv_cache)
+                viewmats=viewmats, Ks=Ks, prope_kv_cache=prope_kv_cache,
+                retrieval_kv=retrieval_kv)
             x = x + y * e[2].squeeze(2)
 
             # cross-attention & ffn function
@@ -534,7 +645,8 @@ class CausalWanAttentionBlock(nn.Module):
                 (self.norm1(x).unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * (1 + e[1]) + e[0]).flatten(1, 2),
                 seq_lens, grid_sizes,
                 freqs, block_mask, kv_cache, current_start, cache_start,
-                viewmats=viewmats, Ks=Ks, prope_kv_cache=prope_kv_cache)
+                viewmats=viewmats, Ks=Ks, prope_kv_cache=prope_kv_cache,
+                retrieval_kv=retrieval_kv)
 
             # with amp.autocast(dtype=torch.float32):
             x = x + (y.unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * e[2]).flatten(1, 2)
@@ -949,7 +1061,8 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         cache_start: int = 0,
         viewmats=None,
         Ks=None,
-        prope_kv_cache=None
+        prope_kv_cache=None,
+        retrieval_kv=None,
     ):
         r"""
         Run the diffusion model with kv caching.
@@ -1091,7 +1204,8 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                         "kv_cache": kv_cache[block_index],
                         "current_start": current_start,
                         "cache_start": cache_start,
-                        "prope_kv_cache": prope_kv_cache[block_index] if prope_kv_cache is not None else None
+                        "prope_kv_cache": prope_kv_cache[block_index] if prope_kv_cache is not None else None,
+                        "retrieval_kv": retrieval_kv[block_index] if retrieval_kv is not None else None,
                     }
                 )
                 x = torch.utils.checkpoint.checkpoint(
@@ -1106,7 +1220,8 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                         "crossattn_cache": crossattn_cache[block_index],
                         "current_start": current_start,
                         "cache_start": cache_start,
-                        "prope_kv_cache": prope_kv_cache[block_index] if prope_kv_cache is not None else None
+                        "prope_kv_cache": prope_kv_cache[block_index] if prope_kv_cache is not None else None,
+                        "retrieval_kv": retrieval_kv[block_index] if retrieval_kv is not None else None,
                     }
                 )
                 x = block(x, **kwargs)

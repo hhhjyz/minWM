@@ -3,11 +3,12 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")"; pwd)"
 
-DATA_PATH="${DATA_PATH:-Wan21/prompts/tartanair_long5_120/prompts.txt}"
-TRAJECTORY_PATH="${TRAJECTORY_PATH:-Wan21/prompts/tartanair_long5_120/trajectories.txt}"
+DATA_PATH="${DATA_PATH:-Wan21/prompts/viewbench_small12/prompts.txt}"
+TRAJECTORY_POSE_PATH="${TRAJECTORY_POSE_PATH:-Wan21/prompts/viewbench_small12/trajectory_pose_paths.txt}"
+TRAJECTORY_PATH="${TRAJECTORY_PATH:-}"
 MAX_PROMPTS="${MAX_PROMPTS:-1}"
 PROMPT_START="${PROMPT_START:-0}"
-NUM_OUTPUT_FRAMES="${NUM_OUTPUT_FRAMES:-120}"
+NUM_OUTPUT_FRAMES="${NUM_OUTPUT_FRAMES:-180}"
 SINK_SIZE="${SINK_SIZE:-4}"
 SINK_UPDATE_INTERVAL="${SINK_UPDATE_INTERVAL:-4}"
 RUN_PREFIX="${RUN_PREFIX:-sink_ablation}"
@@ -19,6 +20,7 @@ run_case() {
   local interval="$4"
 
   DATA_PATH="$DATA_PATH" \
+  TRAJECTORY_POSE_PATH="$TRAJECTORY_POSE_PATH" \
   TRAJECTORY_PATH="$TRAJECTORY_PATH" \
   MAX_PROMPTS="$MAX_PROMPTS" \
   PROMPT_START="$PROMPT_START" \

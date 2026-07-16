@@ -7,6 +7,7 @@ from wan.utils.fm_solvers import FlowDPMSolverMultistepScheduler, get_sampling_s
 from wan.utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
 from wan_utils.wan_wrapper import WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper
 from .debug_utils import log_cache_state, should_log_cache
+from .kv_bank import KVBank
 from .sink_utils import get_model_sink_size_frames, maybe_update_periodic_sink, normalize_sink_strategy
 
 
@@ -52,19 +53,137 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
         self.sink_strategy = normalize_sink_strategy(getattr(args, "sink_strategy", "none"))
         self.sink_update_interval = int(getattr(args, "sink_update_interval", 0))
         self.sink_size_frames = get_model_sink_size_frames(self.generator)
+        self.retrieval_enable = bool(getattr(args, "retrieval_enable", False))
+        self.retrieval_metric = str(getattr(args, "retrieval_metric", "pose"))
+        self.retrieval_frames = max(0, int(getattr(args, "retrieval_frames", 0)))
+        self.retrieval_recent_frames = max(0, int(getattr(args, "retrieval_recent_frames", 0)))
+        self.retrieval_fov_samples = max(1, int(getattr(args, "retrieval_fov_samples", 8192)))
+        self.retrieval_fov_radius = float(getattr(args, "retrieval_fov_radius", 8.0))
+        self.retrieval_fov_h_deg = float(getattr(args, "retrieval_fov_h_deg", 60.0))
+        self.retrieval_fov_v_deg = float(getattr(args, "retrieval_fov_v_deg", 35.0))
+        self.retrieval_hybrid_fov_weight = float(getattr(args, "retrieval_hybrid_fov_weight", 0.5))
+        self.retrieval_rope_correction = bool(getattr(args, "retrieval_rope_correction", False))
+        self.kv_compression_enable = bool(getattr(args, "kv_compression_enable", False))
+        self.kv_compression_keep_ratio = float(getattr(args, "kv_compression_keep_ratio", 0.5))
+        self.kv_compression_at_store = bool(getattr(args, "kv_compression_at_store", False))
+        self.kv_compression_anchor_rotate = bool(getattr(args, "kv_compression_anchor_rotate", False))
+        self.kv_compression_pooled = bool(getattr(args, "kv_compression_pooled", False))
+        self.kv_bank = KVBank(
+            enabled=bool(getattr(args, "kv_bank_enable", False)) or self.retrieval_enable,
+            device=str(getattr(args, "kv_bank_device", "cpu")),
+            max_blocks=int(getattr(args, "kv_bank_max_blocks", 0)),
+            log_interval=int(getattr(args, "kv_bank_log_interval", 1)),
+            warn_memory_gb=float(getattr(args, "kv_bank_warn_memory_gb", 16.0)),
+            compression_enable=self.kv_compression_enable,
+            compression_keep_ratio=self.kv_compression_keep_ratio,
+            compression_at_store=self.kv_compression_at_store,
+            compression_pooled=self.kv_compression_pooled,
+        )
         if self.sink_strategy != "none":
             print(
                 f"Sink strategy: {self.sink_strategy} "
                 f"(sink_size={self.sink_size_frames}, update_interval={self.sink_update_interval})"
             )
+        if self.kv_bank.enabled:
+            print(
+                f"KV bank enabled: device={self.kv_bank.device_name} "
+                f"max_blocks={self.kv_bank.max_blocks or 'unlimited'}"
+            )
+        if self.retrieval_enable:
+            print(
+                f"Retrieval window enabled: metric={self.retrieval_metric} "
+                f"retrieval_frames={self.retrieval_frames} recent_exclusion={self.retrieval_recent_frames}"
+            )
 
         # Latency of producing the first chunk (set by inference()).
         self.last_chunk0_latency = None
+        self.last_chunk_seconds = None
+        self.last_chunk_num_frames = None
+        self.last_chunk_fps = None
+        self.last_retrieval_events = []
 
         print(f"KV inference with {self.num_frame_per_block} frames per block")
 
         if self.num_frame_per_block > 1:
             self.generator.model.num_frame_per_block = self.num_frame_per_block
+
+    def _build_retrieval_payloads(
+        self,
+        *,
+        branch: str,
+        current_start_frame: int,
+        current_num_frames: int,
+        viewmats,
+        device,
+    ):
+        if not self.retrieval_enable or self.retrieval_frames <= 0:
+            return None
+        retrieval_t0 = time.perf_counter()
+        selected, details = self.kv_bank.select_retrieval_blocks(
+            current_viewmats=viewmats,
+            current_frame_start=current_start_frame,
+            current_frame_count=current_num_frames,
+            retrieval_frames=self.retrieval_frames,
+            metric=self.retrieval_metric,
+            fov_samples=self.retrieval_fov_samples,
+            fov_radius=self.retrieval_fov_radius,
+            fov_h_deg=self.retrieval_fov_h_deg,
+            fov_v_deg=self.retrieval_fov_v_deg,
+            hybrid_fov_weight=self.retrieval_hybrid_fov_weight,
+            recent_frames=self.retrieval_recent_frames,
+            sink_size_frames=self.sink_size_frames,
+            device=device,
+            return_details=True,
+        )
+        selection_seconds = time.perf_counter() - retrieval_t0
+        if not selected:
+            self.last_retrieval_events.append({
+                "branch": branch,
+                "current_frame_start": current_start_frame,
+                "current_num_frames": current_num_frames,
+                "metric": self.retrieval_metric,
+                "retrieval_frames": self.retrieval_frames,
+                "rope_correction": self.retrieval_rope_correction,
+                "candidate_block_ids": details.get("candidate_block_ids", []),
+                "selected_block_ids": [],
+                "selected_frame_starts": [],
+                "distances": details.get("distances", []),
+                "retrieved_tokens_per_layer": 0,
+                "selection_seconds": selection_seconds,
+                "payload_seconds": 0.0,
+            })
+            return None
+        payload_t0 = time.perf_counter()
+        payloads = self.kv_bank.get_retrieval_payloads(
+            selected,
+            branch=branch,
+            device=device,
+            include_prope=viewmats is not None,
+            compress_runtime=self.kv_compression_enable and not self.kv_compression_at_store,
+            compression_keep_ratio=self.kv_compression_keep_ratio,
+            compression_anchor_rotate=self.kv_compression_anchor_rotate,
+            compression_pooled=self.kv_compression_pooled,
+            frame_seq_length=self.frame_seq_length,
+            rope_correction=self.retrieval_rope_correction,
+        )
+        payload_seconds = time.perf_counter() - payload_t0
+        retrieved_tokens = int(payloads[0]["k"].shape[1]) if payloads else 0
+        self.last_retrieval_events.append({
+            "branch": branch,
+            "current_frame_start": current_start_frame,
+            "current_num_frames": current_num_frames,
+            "metric": self.retrieval_metric,
+            "retrieval_frames": self.retrieval_frames,
+            "rope_correction": self.retrieval_rope_correction,
+            "candidate_block_ids": details.get("candidate_block_ids", []),
+            "selected_block_ids": details.get("selected_block_ids", []),
+            "selected_frame_starts": details.get("selected_frame_starts", []),
+            "distances": details.get("distances", []),
+            "retrieved_tokens_per_layer": retrieved_tokens,
+            "selection_seconds": selection_seconds,
+            "payload_seconds": payload_seconds,
+        })
+        return payloads
 
     def inference(
         self,
@@ -119,6 +238,10 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
         torch.cuda.synchronize()
         _chunk0_t0 = time.perf_counter()
         self.last_chunk0_latency = None
+        self.last_chunk_seconds = None
+        self.last_chunk_num_frames = None
+        self.last_chunk_fps = None
+        self.last_retrieval_events = []
 
         output = torch.zeros(
             [batch_size, num_output_frames, num_channels, height, width],
@@ -251,7 +374,10 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
         all_num_frames = [self.num_frame_per_block] * num_blocks
         if self.independent_first_frame and initial_latent is None:
             all_num_frames = [1] + all_num_frames
+        self.kv_bank.reset(expected_blocks=len(all_num_frames))
         for block_index, current_num_frames in enumerate(all_num_frames):
+            torch.cuda.synchronize()
+            _block_t0 = time.perf_counter()
             noisy_input = noise[
                 :, cache_start_frame - num_input_frames:cache_start_frame + current_num_frames - num_input_frames]
             latents = noisy_input
@@ -259,6 +385,20 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
             # Slice viewmats/Ks for current chunk
             vm_chunk = viewmats[:, current_start_frame:current_start_frame + current_num_frames] if viewmats is not None else None
             ks_chunk = Ks[:, current_start_frame:current_start_frame + current_num_frames] if Ks is not None else None
+            retrieval_kv_cond = self._build_retrieval_payloads(
+                branch="cond",
+                current_start_frame=current_start_frame,
+                current_num_frames=current_num_frames,
+                viewmats=vm_chunk,
+                device=noise.device,
+            )
+            retrieval_kv_uncond = self._build_retrieval_payloads(
+                branch="uncond",
+                current_start_frame=current_start_frame,
+                current_num_frames=current_num_frames,
+                viewmats=vm_chunk,
+                device=noise.device,
+            )
             if should_log_cache(self.log_cache_state, block_index, self.log_cache_interval):
                 log_cache_state(
                     tag="before_denoise",
@@ -290,7 +430,8 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                     cache_start=cache_start_frame * self.frame_seq_length,
                     viewmats=vm_chunk,
                     Ks=ks_chunk,
-                    prope_kv_cache=self.prope_kv_cache_pos
+                    prope_kv_cache=self.prope_kv_cache_pos,
+                    retrieval_kv=retrieval_kv_cond,
                 )
                 flow_pred_uncond, _ = self.generator(
                     noisy_image_or_video=latent_model_input,
@@ -302,7 +443,8 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                     cache_start=cache_start_frame * self.frame_seq_length,
                     viewmats=vm_chunk,
                     Ks=ks_chunk,
-                    prope_kv_cache=self.prope_kv_cache_neg
+                    prope_kv_cache=self.prope_kv_cache_neg,
+                    retrieval_kv=retrieval_kv_uncond,
                 )
 
                 flow_pred = flow_pred_uncond + self.args.guidance_scale * (
@@ -334,7 +476,8 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                 cache_start=cache_start_frame * self.frame_seq_length,
                 viewmats=vm_chunk,
                 Ks=ks_chunk,
-                prope_kv_cache=self.prope_kv_cache_pos
+                prope_kv_cache=self.prope_kv_cache_pos,
+                retrieval_kv=retrieval_kv_cond,
             )
             self.generator(
                 noisy_image_or_video=latents,
@@ -346,7 +489,26 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                 cache_start=cache_start_frame * self.frame_seq_length,
                 viewmats=vm_chunk,
                 Ks=ks_chunk,
-                prope_kv_cache=self.prope_kv_cache_neg
+                prope_kv_cache=self.prope_kv_cache_neg,
+                retrieval_kv=retrieval_kv_uncond,
+            )
+            self.kv_bank.append_block(
+                block_id=block_index,
+                frame_start=current_start_frame,
+                frame_count=current_num_frames,
+                frame_seq_length=self.frame_seq_length,
+                cache_branches={
+                    "cond": (
+                        self.kv_cache_pos,
+                        self.prope_kv_cache_pos if viewmats is not None else None,
+                    ),
+                    "uncond": (
+                        self.kv_cache_neg,
+                        self.prope_kv_cache_neg if viewmats is not None else None,
+                    ),
+                },
+                viewmats=vm_chunk,
+                Ks=ks_chunk,
             )
             maybe_update_periodic_sink(
                 strategy=self.sink_strategy,
@@ -382,6 +544,12 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                     viewmats=vm_chunk,
                     device=noise.device,
                 )
+
+            torch.cuda.synchronize()
+            block_seconds = time.perf_counter() - _block_t0
+            self.last_chunk_seconds = block_seconds
+            self.last_chunk_num_frames = current_num_frames
+            self.last_chunk_fps = current_num_frames / block_seconds if block_seconds > 0 else None
 
             # Step 3.4: update the start and end frame indices
             current_start_frame += current_num_frames

@@ -18,6 +18,15 @@ NUMERIC_FIELDS = [
     "write_video_seconds",
     "total_seconds",
     "chunk0_latency_seconds",
+    "last_chunk_seconds",
+    "last_chunk_num_frames",
+    "last_chunk_fps",
+    "peak_vram_allocated_gb",
+    "peak_vram_reserved_gb",
+    "kv_bank_blocks",
+    "kv_bank_evicted_blocks",
+    "kv_bank_total_bytes",
+    "kv_bank_total_gb",
 ]
 
 
@@ -81,6 +90,11 @@ def make_summary(rows, run_meta):
     postprocess_seconds = [row.get("postprocess_seconds") for row in gen]
     write_video_seconds = [row.get("write_video_seconds") for row in gen]
     chunk0 = [row.get("chunk0_latency_seconds") for row in gen]
+    last_chunk_fps = [row.get("last_chunk_fps") for row in gen]
+    peak_alloc = [row.get("peak_vram_allocated_gb") for row in gen]
+    peak_reserved = [row.get("peak_vram_reserved_gb") for row in gen]
+    bank_blocks = [row.get("kv_bank_blocks") for row in gen]
+    bank_total_gb = [row.get("kv_bank_total_gb") for row in gen]
     frames = [row.get("num_output_frames") for row in gen if row.get("num_output_frames") is not None]
     total_frames = sum(frames) if frames else None
     wall = run_meta.get("wall_time_seconds")
@@ -96,6 +110,11 @@ def make_summary(rows, run_meta):
         "avg_postprocess_seconds_per_video": mean(postprocess_seconds),
         "avg_write_video_seconds_per_video": mean(write_video_seconds),
         "avg_chunk0_latency_seconds": mean(chunk0),
+        "avg_last_chunk_fps": mean(last_chunk_fps),
+        "max_peak_vram_allocated_gb": max([v for v in peak_alloc if v is not None], default=None),
+        "max_peak_vram_reserved_gb": max([v for v in peak_reserved if v is not None], default=None),
+        "max_kv_bank_blocks": max([v for v in bank_blocks if v is not None], default=None),
+        "max_kv_bank_total_gb": max([v for v in bank_total_gb if v is not None], default=None),
         "total_requested_frames": total_frames,
         "avg_frames_per_second_by_video_time": (
             total_frames / sum(v for v in total_seconds if v is not None)
@@ -164,12 +183,22 @@ def main():
 
     if args.times_csv.exists():
         shutil.copy2(args.times_csv, args.output_dir / "inference_times.csv")
+    retrieval_csv = args.times_csv.with_name("retrieval_events.csv")
+    retrieval_jsonl = args.times_csv.with_name("retrieval_events.jsonl")
+    if retrieval_csv.exists():
+        shutil.copy2(retrieval_csv, args.output_dir / "retrieval_events.csv")
+    if retrieval_jsonl.exists():
+        shutil.copy2(retrieval_jsonl, args.output_dir / "retrieval_events.jsonl")
 
     summary = make_summary(rows, run_meta)
     summary["artifacts"] = {
         "log_file": str(args.log_file),
         "times_csv": str(args.output_dir / "inference_times.csv"),
     }
+    if retrieval_csv.exists():
+        summary["artifacts"]["retrieval_csv"] = str(args.output_dir / "retrieval_events.csv")
+    if retrieval_jsonl.exists():
+        summary["artifacts"]["retrieval_jsonl"] = str(args.output_dir / "retrieval_events.jsonl")
 
     plt, plot_error = maybe_import_plotting()
     if plt is not None:
@@ -193,6 +222,11 @@ def main():
         f"avg_postprocess_seconds_per_video: {summary['avg_postprocess_seconds_per_video']}",
         f"avg_write_video_seconds_per_video: {summary['avg_write_video_seconds_per_video']}",
         f"avg_chunk0_latency_seconds: {summary['avg_chunk0_latency_seconds']}",
+        f"avg_last_chunk_fps: {summary['avg_last_chunk_fps']}",
+        f"max_peak_vram_allocated_gb: {summary['max_peak_vram_allocated_gb']}",
+        f"max_peak_vram_reserved_gb: {summary['max_peak_vram_reserved_gb']}",
+        f"max_kv_bank_blocks: {summary['max_kv_bank_blocks']}",
+        f"max_kv_bank_total_gb: {summary['max_kv_bank_total_gb']}",
         f"avg_frames_per_second_by_video_time: {summary['avg_frames_per_second_by_video_time']}",
         f"avg_frames_per_second_by_wall_time: {summary['avg_frames_per_second_by_wall_time']}",
         f"plots: {len(plots)}",

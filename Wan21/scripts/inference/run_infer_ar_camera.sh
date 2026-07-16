@@ -24,9 +24,12 @@ SINK_UPDATE_INTERVAL="${SINK_UPDATE_INTERVAL:-0}"
 # ===== Camera Trajectory =====
 TRAJECTORY="${TRAJECTORY:-w*19}"
 TRAJECTORY_PATH="${TRAJECTORY_PATH:-}"
+TRAJECTORY_POSE_PATH="${TRAJECTORY_POSE_PATH:-}"
 
 # Build trajectory argument
-if [ -n "$TRAJECTORY_PATH" ]; then
+if [ -n "$TRAJECTORY_POSE_PATH" ]; then
+  TRAJ_ARGS="--trajectory_pose_path $TRAJECTORY_POSE_PATH"
+elif [ -n "$TRAJECTORY_PATH" ]; then
   TRAJ_ARGS="--trajectory_path $TRAJECTORY_PATH"
 else
   TRAJ_ARGS="--trajectory $TRAJECTORY"
@@ -48,6 +51,7 @@ echo "  Config:     $CONFIG_PATH"
 echo "  Checkpoint: $CHECKPOINT_PATH"
 echo "  Output:     $OUTPUT_FOLDER"
 echo "  Subset:     start=$PROMPT_START max=$MAX_PROMPTS frames=$NUM_OUTPUT_FRAMES"
+echo "  Pose path:  ${TRAJECTORY_POSE_PATH:-<trajectory-string-mode>}"
 echo "  Sink:       strategy=$SINK_STRATEGY size=$SINK_SIZE update_interval=$SINK_UPDATE_INTERVAL"
 
 export SP_SIZE=$SP_SIZE
