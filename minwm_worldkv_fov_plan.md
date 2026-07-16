@@ -106,6 +106,41 @@ cd /pool/hdd/home/hhhjyz/research/minWM
 bash Wan21/scripts/inference/run_smoke_causal_camera.sh
 ```
 
+### 带耗时 profiling 的 smoke test
+
+如果需要在推理结束后自动保存每个视频的耗时，使用 profiling 入口：
+
+```bash
+cd /pool/hdd/home/hhhjyz/research/minWM
+
+MAX_PROMPTS=5 \
+NUM_OUTPUT_FRAMES=80 \
+OUTPUT_FOLDER=./outputs/profile_tartanair_long5_120 \
+bash Wan21/scripts/inference/run_profiled_smoke_causal_camera.sh
+```
+
+生成内容会保存在：
+
+```text
+./outputs/profile_tartanair_long5_120/profile/
+```
+
+主要文件：
+
+- `inference.log`：完整推理日志。
+- `inference_times.csv`：每个视频的耗时明细。
+- `profile_summary.json` / `profile_summary.txt`：平均每视频耗时、平均生成耗时、写视频耗时、wall time 和估计 FPS。
+- `video_total_seconds.png`：每个视频总耗时图。
+- `video_stage_seconds.png`：每个视频的 generation / postprocess / write video 分段耗时图。
+
+默认不会记录 GPU 显存或 KV/cache 状态。如果某次确实要调试 cache，可以显式打开：
+
+```bash
+LOG_CACHE_STATE=1 \
+MAX_PROMPTS=5 \
+bash Wan21/scripts/inference/run_profiled_smoke_causal_camera.sh
+```
+
 如需覆盖默认值，可以在命令前设置环境变量：
 
 ```bash
@@ -214,6 +249,32 @@ bash Wan21/scripts/inference/run_infer_causal_camera.sh
 
 在加入完整 retrieval 之前，先测试长期 memory anchor 是否能改善长时一致性。
 
+### 当前状态
+
+已实现，默认关闭，不改变 baseline。新增参数：
+
+```bash
+--sink_strategy none|fixed|periodic
+--sink_size 4
+--sink_update_interval 4
+```
+
+推理脚本环境变量：
+
+```bash
+SINK_STRATEGY=none|fixed|periodic
+SINK_SIZE=4
+SINK_UPDATE_INTERVAL=4
+```
+
+实现位置：
+
+- `minWM/Wan21/wan_inference.py`
+- `minWM/Wan21/pipeline/sink_utils.py`
+- `minWM/Wan21/pipeline/causal_inference.py`
+- `minWM/Wan21/pipeline/causal_diffusion_inference.py`
+- `minWM/Wan21/scripts/inference/run_sink_ablation_causal_camera.sh`
+
 ### 实验变体
 
 1. 原始 minWM：
@@ -241,6 +302,60 @@ sink_size = 4
 
 含义是：每隔 N 个生成 block，把最新 clean block 的 KV 写入 sink 区域，替换旧的 sink。
 
+### 推荐运行命令
+
+一键跑 baseline / fixed sink / periodic sink 三组对比：
+
+```bash
+cd /pool/hdd/home/hhhjyz/research/minWM
+
+MAX_PROMPTS=5 \
+NUM_OUTPUT_FRAMES=80 \
+SINK_SIZE=4 \
+SINK_UPDATE_INTERVAL=4 \
+RUN_PREFIX=sink_ablation_tartanair120 \
+bash Wan21/scripts/inference/run_sink_ablation_causal_camera.sh
+```
+
+输出目录示例：
+
+```text
+outputs/sink_ablation_tartanair120_baseline_0_1_120/
+outputs/sink_ablation_tartanair120_fixed_sink4_0_1_120/
+outputs/sink_ablation_tartanair120_periodic_sink4_int4_0_1_120/
+```
+
+每个目录下都会保留：
+
+- 生成视频；
+- `inference_times.csv` / `inference_times.json`；
+- `profile/profile_summary.txt`；
+- `profile/video_total_seconds.png`；
+- `profile/video_stage_seconds.png`。
+
+单独跑 fixed sink：
+
+```bash
+SINK_STRATEGY=fixed \
+SINK_SIZE=4 \
+MAX_PROMPTS=1 \
+NUM_OUTPUT_FRAMES=120 \
+OUTPUT_FOLDER=./outputs/fixed_sink4_test \
+bash Wan21/scripts/inference/run_profiled_smoke_causal_camera.sh
+```
+
+单独跑 periodic sink：
+
+```bash
+SINK_STRATEGY=periodic \
+SINK_SIZE=4 \
+SINK_UPDATE_INTERVAL=4 \
+MAX_PROMPTS=1 \
+NUM_OUTPUT_FRAMES=120 \
+OUTPUT_FOLDER=./outputs/periodic_sink4_int4_test \
+bash Wan21/scripts/inference/run_profiled_smoke_causal_camera.sh
+```
+
 ### 关键风险
 
 minWM 的 camera PRoPE 有独立的 `prope_kv_cache`。任何 sink 更新都必须同步处理：
@@ -249,6 +364,12 @@ minWM 的 camera PRoPE 有独立的 `prope_kv_cache`。任何 sink 更新都必�
 - `prope_kv_cache`
 
 如果只更新其中一个，普通 attention 和 camera-aware PRoPE attention 会看到不一致的历史信息。
+
+当前 periodic sink update 已同步处理：
+
+- `kv_cache_pos` / `kv_cache_neg`
+- `prope_kv_cache_pos` / `prope_kv_cache_neg`
+- DMD/ODE 单条件路径中的 `kv_cache1` / `prope_kv_cache1`
 
 ### 实现提示
 
@@ -265,7 +386,7 @@ model_kwargs:
   sink_size: 4
 ```
 
-定时更新 sink 则需要在 clean context pass 之后，把最新 block 的 clean KV 拷贝到 sink token 区域。
+定时更新 sink 在 clean context pass 之后执行，把最新 block 的 clean KV 拷贝到 sink token 区域。该操作不改变 cache index，只替换 sink 区域内容，因此可以和原有 local window 滚动逻辑共存。
 
 ### 成功标准
 

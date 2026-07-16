@@ -7,6 +7,7 @@ from wan_utils.wan_wrapper import WanDiffusionWrapper, WanTextEncoder, WanVAEWra
 from demo_utils.memory import gpu, get_cuda_free_memory_gb, DynamicSwapInstaller, move_model_to_device_with_memory_preservation
 import tqdm
 from .debug_utils import log_cache_state, should_log_cache
+from .sink_utils import get_model_sink_size_frames, maybe_update_periodic_sink, normalize_sink_strategy
 
 class CausalInferencePipeline(torch.nn.Module):
     def __init__(
@@ -43,6 +44,14 @@ class CausalInferencePipeline(torch.nn.Module):
         self.local_attn_size = self.generator.model.local_attn_size
         self.log_cache_state = bool(getattr(args, "log_cache_state", False))
         self.log_cache_interval = int(getattr(args, "log_cache_interval", 1))
+        self.sink_strategy = normalize_sink_strategy(getattr(args, "sink_strategy", "none"))
+        self.sink_update_interval = int(getattr(args, "sink_update_interval", 0))
+        self.sink_size_frames = get_model_sink_size_frames(self.generator)
+        if self.sink_strategy != "none":
+            print(
+                f"Sink strategy: {self.sink_strategy} "
+                f"(sink_size={self.sink_size_frames}, update_interval={self.sink_update_interval})"
+            )
 
         # Latency of producing the first chunk (set by inference()).
         self.last_chunk0_latency = None
@@ -303,6 +312,17 @@ class CausalInferencePipeline(torch.nn.Module):
                 viewmats=vm_chunk,
                 Ks=ks_chunk,
                 prope_kv_cache=self.prope_kv_cache1,
+            )
+            maybe_update_periodic_sink(
+                strategy=self.sink_strategy,
+                update_interval=self.sink_update_interval,
+                block_index=block_index,
+                current_num_frames=current_num_frames,
+                frame_seq_length=self.frame_seq_length,
+                sink_size_frames=self.sink_size_frames,
+                kv_cache=self.kv_cache1,
+                prope_kv_cache=self.prope_kv_cache1,
+                label="causal",
             )
             if should_log_cache(self.log_cache_state, block_index, self.log_cache_interval):
                 log_cache_state(

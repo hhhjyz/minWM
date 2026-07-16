@@ -1,6 +1,8 @@
 import argparse
+import csv
 import torch
 import os
+import time
 from omegaconf import OmegaConf
 from tqdm import tqdm
 from torchvision import transforms
@@ -33,6 +35,9 @@ parser.add_argument("--trajectory", type=str, default=None, help="Camera traject
 parser.add_argument("--trajectory_path", type=str, default=None, help="Path to trajectory file (one trajectory string per line, aligned with data_path)")
 parser.add_argument("--log_cache_state", action="store_true", help="Log per-block KV/PRoPE cache state and CUDA memory.")
 parser.add_argument("--log_cache_interval", type=int, default=1, help="Log every N generated blocks when --log_cache_state is enabled.")
+parser.add_argument("--sink_strategy", type=str, default="none", choices=["none", "fixed", "periodic"], help="Sink-frame KV cache strategy.")
+parser.add_argument("--sink_size", type=int, default=0, help="Number of latent frames reserved as sink frames.")
+parser.add_argument("--sink_update_interval", type=int, default=0, help="For periodic sink, update sink every N generated blocks.")
 args = parser.parse_args()
 
 # Initialize distributed inference
@@ -84,6 +89,20 @@ default_config = OmegaConf.load("Wan21/configs/default_config.yaml")
 config = OmegaConf.merge(default_config, config)
 config.log_cache_state = args.log_cache_state
 config.log_cache_interval = max(1, args.log_cache_interval)
+if args.sink_strategy != "none":
+    assert args.sink_size > 0, "--sink_size must be > 0 when sink_strategy is fixed or periodic"
+if args.sink_strategy == "periodic":
+    assert args.sink_update_interval > 0, "--sink_update_interval must be > 0 for periodic sink"
+model_kwargs = config.get("model_kwargs", {})
+local_attn_size = int(model_kwargs.get("local_attn_size", -1))
+if args.sink_size > 0 and local_attn_size != -1:
+    assert args.sink_size < local_attn_size, (
+        f"sink_size={args.sink_size} must be smaller than local_attn_size={local_attn_size}"
+    )
+effective_sink_size = int(args.sink_size) if args.sink_strategy != "none" else 0
+config.model_kwargs.sink_size = effective_sink_size
+config.sink_strategy = args.sink_strategy
+config.sink_update_interval = int(args.sink_update_interval)
 
 # Import pipeline AFTER distributed init so causal_model.py sees CleanCode SP infra
 from pipeline import (
@@ -185,6 +204,31 @@ if local_rank == 0:
 if dist.is_initialized():
     dist.barrier()
 
+timing_csv_path = os.path.join(args.output_folder, "inference_times.csv")
+timing_json_path = os.path.join(args.output_folder, "inference_times.json")
+timing_rows = []
+if local_rank == 0:
+    with open(timing_csv_path, "w", newline="", encoding="utf-8") as _f:
+        _writer = csv.DictWriter(
+            _f,
+            fieldnames=[
+                "sample_order",
+                "prompt_index",
+                "status",
+                "prompt",
+                "trajectory",
+                "num_output_frames",
+                "num_generated_latent_frames",
+                "generation_seconds",
+                "postprocess_seconds",
+                "write_video_seconds",
+                "total_seconds",
+                "chunk0_latency_seconds",
+                "output_path",
+            ],
+        )
+        _writer.writeheader()
+
 # Load per-prompt trajectory list if provided
 trajectory_list = None
 if args.trajectory_path:
@@ -215,6 +259,7 @@ chunk0_latencies = []
 
 
 for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
+    sample_t0 = time.perf_counter()
     idx = batch_data['idx'].item()
 
     if isinstance(batch_data, dict):
@@ -233,6 +278,25 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
         output_path = os.path.join(args.output_folder, f'{prompt[:100]}.mp4')
         if os.path.exists(output_path):
             print('Video has been generated. Pass!')
+            if local_rank == 0:
+                row = {
+                    "sample_order": i,
+                    "prompt_index": idx,
+                    "status": "skipped_exists",
+                    "prompt": prompt,
+                    "trajectory": "",
+                    "num_output_frames": args.num_output_frames,
+                    "num_generated_latent_frames": 0,
+                    "generation_seconds": 0.0,
+                    "postprocess_seconds": 0.0,
+                    "write_video_seconds": 0.0,
+                    "total_seconds": time.perf_counter() - sample_t0,
+                    "chunk0_latency_seconds": "",
+                    "output_path": output_path,
+                }
+                timing_rows.append(row)
+                with open(timing_csv_path, "a", newline="", encoding="utf-8") as _f:
+                    csv.DictWriter(_f, fieldnames=row.keys()).writerow(row)
             continue
         # Process the image
         image = batch['image'].squeeze(0).unsqueeze(0).unsqueeze(2).to(device=device, dtype=torch.bfloat16)
@@ -249,6 +313,25 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
         output_path = os.path.join(args.output_folder, f'{prompt[:100]}.mp4')
         if os.path.exists(output_path):
             print('Video has been generated. Pass!')
+            if local_rank == 0:
+                row = {
+                    "sample_order": i,
+                    "prompt_index": idx,
+                    "status": "skipped_exists",
+                    "prompt": prompt,
+                    "trajectory": "",
+                    "num_output_frames": args.num_output_frames,
+                    "num_generated_latent_frames": 0,
+                    "generation_seconds": 0.0,
+                    "postprocess_seconds": 0.0,
+                    "write_video_seconds": 0.0,
+                    "total_seconds": time.perf_counter() - sample_t0,
+                    "chunk0_latency_seconds": "",
+                    "output_path": output_path,
+                }
+                timing_rows.append(row)
+                with open(timing_csv_path, "a", newline="", encoding="utf-8") as _f:
+                    csv.DictWriter(_f, fieldnames=row.keys()).writerow(row)
             continue
         extended_prompt = batch['extended_prompts'][0] if 'extended_prompts' in batch else None
         if extended_prompt is not None:
@@ -279,6 +362,9 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
         Ks = torch.from_numpy(Ks_np).unsqueeze(0).to(device=device, dtype=torch.bfloat16)
 
     # Generate frames
+    if torch.cuda.is_available():
+        torch.cuda.synchronize(device)
+    generation_t0 = time.perf_counter()
     video, latents = pipeline.inference(
         noise=sampled_noise,
         text_prompts=prompts,
@@ -287,9 +373,13 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
         viewmats=viewmats,
         Ks=Ks
     )
+    if torch.cuda.is_available():
+        torch.cuda.synchronize(device)
+    generation_seconds = time.perf_counter() - generation_t0
 
     # Record latency on rank 0; first prompt is warmup → None.
     # All pipelines stop the timer before VAE decode (see pipeline.last_chunk0_latency).
+    sample_lat = None
     if local_rank == 0:
         sample_lat = getattr(pipeline, "last_chunk0_latency", None)
         if len(chunk0_latencies) >= 1:
@@ -297,6 +387,7 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
         else:
             chunk0_latencies.append(None)
 
+    postprocess_t0 = time.perf_counter()
     current_video = rearrange(video, 'b t c h w -> b t h w c').cpu()
     all_video.append(current_video)
     num_generated_frames += latents.shape[1]
@@ -307,13 +398,43 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
 
     # Clear VAE cache
     pipeline.vae.model.clear_cache()
+    postprocess_seconds = time.perf_counter() - postprocess_t0
 
     traj_suffix = "_" + traj_str.replace("*", "").replace(",", "") if traj_str else ""
     output_path = os.path.join(args.output_folder, f'{prompt[:100]}{traj_suffix}.mp4')
+    write_video_seconds = 0.0
     if not (args.sp_size > 1 and local_rank != 0):
+        write_t0 = time.perf_counter()
         write_video(output_path, video[0], fps=16)
+        write_video_seconds = time.perf_counter() - write_t0
     if dist.is_initialized():
         dist.barrier()
+
+    if local_rank == 0:
+        row = {
+            "sample_order": i,
+            "prompt_index": idx,
+            "status": "generated",
+            "prompt": prompt,
+            "trajectory": traj_str or "",
+            "num_output_frames": args.num_output_frames,
+            "num_generated_latent_frames": num_generated_frames,
+            "generation_seconds": generation_seconds,
+            "postprocess_seconds": postprocess_seconds,
+            "write_video_seconds": write_video_seconds,
+            "total_seconds": time.perf_counter() - sample_t0,
+            "chunk0_latency_seconds": sample_lat if sample_lat is not None and len(chunk0_latencies) > 1 else "",
+            "output_path": output_path,
+        }
+        timing_rows.append(row)
+        with open(timing_csv_path, "a", newline="", encoding="utf-8") as _f:
+            csv.DictWriter(_f, fieldnames=row.keys()).writerow(row)
+        print(
+            f"[video-timing] sample={i} prompt_index={idx} status=generated "
+            f"generation={generation_seconds:.3f}s postprocess={postprocess_seconds:.3f}s "
+            f"write_video={write_video_seconds:.3f}s total={row['total_seconds']:.3f}s "
+            f"output={output_path}"
+        )
 
 
 # Aggregate latency on rank 0 (drop the first prompt's warmup).
@@ -322,5 +443,7 @@ if local_rank == 0:
     if valid:
         print(f"[timing] rank0 chunk0 latency excl. decode (from 2nd prompt): "
               f"avg={sum(valid)/len(valid):.3f}s over {len(valid)} samples")
+    with open(timing_json_path, "w", encoding="utf-8") as _f:
+        json.dump(timing_rows, _f, indent=2, ensure_ascii=False)
 
        
