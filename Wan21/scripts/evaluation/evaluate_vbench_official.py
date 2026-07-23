@@ -53,7 +53,11 @@ def _safe_name(index: int, row: dict[str, Any]) -> str:
 
 
 def prepare_video_dir(timing_csv: Path, output_dir: Path, *, copy_videos: bool) -> tuple[Path, list[dict[str, Any]]]:
-    rows = [row for row in _load_timing(timing_csv) if row.get("status") == "generated"]
+    rows = [
+        row
+        for row in _load_timing(timing_csv)
+        if row.get("status") in {"generated", "skipped_exists"}
+    ]
     video_dir = output_dir / "official_vbench_videos"
     if video_dir.exists():
         shutil.rmtree(video_dir)

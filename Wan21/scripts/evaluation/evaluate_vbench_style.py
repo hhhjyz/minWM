@@ -181,7 +181,11 @@ def main() -> None:
     args = parser.parse_args()
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    rows = [row for row in _load_timing(args.timing_csv) if row.get("status") == "generated"]
+    rows = [
+        row
+        for row in _load_timing(args.timing_csv)
+        if row.get("status") in {"generated", "skipped_exists"}
+    ]
 
     metric_rows = []
     errors = []

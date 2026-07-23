@@ -7,6 +7,9 @@
 
 仓库不再依赖 ViewBench pose、参考视频或 `.npz` 相机文件。官方 VBench 仍可用于评估生成视频的无参考质量指标。
 
+在新设备上重新配置环境、复制 checkpoint、迁移已有输出和断点续跑，请参阅
+[`NEW_DEVICE_SETUP_AND_RERUN.md`](NEW_DEVICE_SETUP_AND_RERUN.md)。
+
 ## 1. 环境与模型
 
 ```bash
