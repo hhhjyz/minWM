@@ -5,7 +5,6 @@ SCRIPT_DIR="$(cd "$(dirname "$0")"; pwd)"
 
 export DATA_PATH="${DATA_PATH:-Wan21/prompts/demos.txt}"
 export TRAJECTORY_PATH="${TRAJECTORY_PATH:-Wan21/prompts/trajectories.txt}"
-export TRAJECTORY_POSE_PATH="${TRAJECTORY_POSE_PATH:-}"
 export MAX_PROMPTS="${MAX_PROMPTS:-1}"
 export PROMPT_START="${PROMPT_START:-0}"
 export NUM_OUTPUT_FRAMES="${NUM_OUTPUT_FRAMES:-20}"

@@ -61,7 +61,7 @@ Bidirectional SFT      ──▶   Stage 1   Teacher Forcing AR Diffusion
 
 **1.3 Inference.**
 
-- ✅ 4-step DMD inference for HY Action2V / HY TI2V / Wan Action2V, multi-GPU sequence parallelism, camera-trajectory control via pose strings (`"a*4,w*8,s*7"`) or JSON files
+- ✅ 4-step DMD inference for HY Action2V / HY TI2V / Wan Action2V, multi-GPU sequence parallelism, camera-trajectory control via action strings (`"a*4,w*8,s*7"`)
 - 🚧 Inference acceleration [TBD]
 
 ### 2. Multi-Backbone Support
@@ -150,6 +150,10 @@ All weights live under `./ckpts/` after download.
 ## 🚀 Quick Start
 
 > The fastest path: install → download three DMD checkpoints → run three demo commands. Full reproduction (all 4 training stages × 3 model lines) is in [§ Data & Training & Reproduction](#️-data--training--reproduction).
+
+For the current Wan Action2V prompt + action-string experiments, including sink, KV bank,
+pose/FOV retrieval, compression, profiling, and VBench evaluation, see
+[`Wan21/README_STRING_CAMERA_EXPERIMENTS.md`](Wan21/README_STRING_CAMERA_EXPERIMENTS.md).
 
 ### 1. Download the demo checkpoints
 

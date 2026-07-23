@@ -1,3 +1,4 @@
+import json
 import time
 from typing import List, Optional
 import torch
@@ -8,7 +9,7 @@ from demo_utils.memory import gpu, get_cuda_free_memory_gb, DynamicSwapInstaller
 import tqdm
 from .debug_utils import log_cache_state, should_log_cache
 from .kv_bank import KVBank
-from .sink_utils import get_model_sink_size_frames, maybe_update_periodic_sink, normalize_sink_strategy
+from .sink_utils import get_model_sink_size_frames, is_bank_sink_strategy, maybe_update_sink, normalize_sink_strategy
 
 class CausalInferencePipeline(torch.nn.Module):
     def __init__(
@@ -47,6 +48,7 @@ class CausalInferencePipeline(torch.nn.Module):
         self.log_cache_interval = int(getattr(args, "log_cache_interval", 1))
         self.sink_strategy = normalize_sink_strategy(getattr(args, "sink_strategy", "none"))
         self.sink_update_interval = int(getattr(args, "sink_update_interval", 0))
+        self.sink_bank_seed = int(getattr(args, "sink_bank_seed", 0))
         self.sink_size_frames = get_model_sink_size_frames(self.generator)
         self.retrieval_enable = bool(getattr(args, "retrieval_enable", False))
         self.retrieval_metric = str(getattr(args, "retrieval_metric", "pose"))
@@ -58,13 +60,15 @@ class CausalInferencePipeline(torch.nn.Module):
         self.retrieval_fov_v_deg = float(getattr(args, "retrieval_fov_v_deg", 35.0))
         self.retrieval_hybrid_fov_weight = float(getattr(args, "retrieval_hybrid_fov_weight", 0.5))
         self.retrieval_rope_correction = bool(getattr(args, "retrieval_rope_correction", False))
+        self.prope_reencode_mode = str(getattr(args, "prope_reencode_mode", "none"))
         self.kv_compression_enable = bool(getattr(args, "kv_compression_enable", False))
         self.kv_compression_keep_ratio = float(getattr(args, "kv_compression_keep_ratio", 0.5))
         self.kv_compression_at_store = bool(getattr(args, "kv_compression_at_store", False))
         self.kv_compression_anchor_rotate = bool(getattr(args, "kv_compression_anchor_rotate", False))
         self.kv_compression_pooled = bool(getattr(args, "kv_compression_pooled", False))
+        self.kv_compression_dynamic_enable = bool(getattr(args, "kv_compression_dynamic_enable", False))
         self.kv_bank = KVBank(
-            enabled=bool(getattr(args, "kv_bank_enable", False)) or self.retrieval_enable,
+            enabled=bool(getattr(args, "kv_bank_enable", False)) or self.retrieval_enable or is_bank_sink_strategy(self.sink_strategy),
             device=str(getattr(args, "kv_bank_device", "cpu")),
             max_blocks=int(getattr(args, "kv_bank_max_blocks", 0)),
             log_interval=int(getattr(args, "kv_bank_log_interval", 1)),
@@ -73,6 +77,12 @@ class CausalInferencePipeline(torch.nn.Module):
             compression_keep_ratio=self.kv_compression_keep_ratio,
             compression_at_store=self.kv_compression_at_store,
             compression_pooled=self.kv_compression_pooled,
+            compression_dynamic_enable=self.kv_compression_dynamic_enable,
+            compression_dynamic_min_keep=float(getattr(args, "kv_compression_dynamic_min_keep", 0.25)),
+            compression_dynamic_max_keep=float(getattr(args, "kv_compression_dynamic_max_keep", 0.75)),
+            compression_dynamic_translation_scale=float(getattr(args, "kv_compression_dynamic_translation_scale", 1.0)),
+            compression_dynamic_rotation_scale=float(getattr(args, "kv_compression_dynamic_rotation_scale", 0.35)),
+            compression_dynamic_motion_weight=float(getattr(args, "kv_compression_dynamic_motion_weight", 0.25)),
         )
         if self.sink_strategy != "none":
             print(
@@ -102,6 +112,10 @@ class CausalInferencePipeline(torch.nn.Module):
         if self.num_frame_per_block > 1:
             self.generator.model.num_frame_per_block = self.num_frame_per_block
 
+    def _record_retrieval_event(self, event):
+        self.last_retrieval_events.append(event)
+        print(f"[retrieval-event] {json.dumps(event, ensure_ascii=False)}", flush=True)
+
     def _build_retrieval_payloads(
         self,
         *,
@@ -109,6 +123,7 @@ class CausalInferencePipeline(torch.nn.Module):
         current_start_frame: int,
         current_num_frames: int,
         viewmats,
+        Ks,
         device,
     ):
         if not self.retrieval_enable or self.retrieval_frames <= 0:
@@ -132,13 +147,15 @@ class CausalInferencePipeline(torch.nn.Module):
         )
         selection_seconds = time.perf_counter() - retrieval_t0
         if not selected:
-            self.last_retrieval_events.append({
+            self._record_retrieval_event({
                 "branch": branch,
                 "current_frame_start": current_start_frame,
                 "current_num_frames": current_num_frames,
                 "metric": self.retrieval_metric,
                 "retrieval_frames": self.retrieval_frames,
                 "rope_correction": self.retrieval_rope_correction,
+                "prope_reencode_mode": self.prope_reencode_mode,
+                "prope_reencoded": False,
                 "candidate_block_ids": details.get("candidate_block_ids", []),
                 "selected_block_ids": [],
                 "selected_frame_starts": [],
@@ -160,16 +177,21 @@ class CausalInferencePipeline(torch.nn.Module):
             compression_pooled=self.kv_compression_pooled,
             frame_seq_length=self.frame_seq_length,
             rope_correction=self.retrieval_rope_correction,
+            prope_reencode_mode=self.prope_reencode_mode,
+            current_viewmats=viewmats,
+            current_Ks=Ks,
         )
         payload_seconds = time.perf_counter() - payload_t0
         retrieved_tokens = int(payloads[0]["k"].shape[1]) if payloads else 0
-        self.last_retrieval_events.append({
+        self._record_retrieval_event({
             "branch": branch,
             "current_frame_start": current_start_frame,
             "current_num_frames": current_num_frames,
             "metric": self.retrieval_metric,
             "retrieval_frames": self.retrieval_frames,
             "rope_correction": self.retrieval_rope_correction,
+            "prope_reencode_mode": self.prope_reencode_mode,
+            "prope_reencoded": bool(payloads[0].get("prope_reencoded", False)) if payloads else False,
             "candidate_block_ids": details.get("candidate_block_ids", []),
             "selected_block_ids": details.get("selected_block_ids", []),
             "selected_frame_starts": details.get("selected_frame_starts", []),
@@ -367,6 +389,7 @@ class CausalInferencePipeline(torch.nn.Module):
                 current_start_frame=current_start_frame,
                 current_num_frames=current_num_frames,
                 viewmats=vm_chunk,
+                Ks=ks_chunk,
                 device=noise.device,
             )
             if should_log_cache(self.log_cache_state, block_index, self.log_cache_interval):
@@ -463,15 +486,28 @@ class CausalInferencePipeline(torch.nn.Module):
                 viewmats=vm_chunk,
                 Ks=ks_chunk,
             )
-            maybe_update_periodic_sink(
+            maybe_update_sink(
                 strategy=self.sink_strategy,
                 update_interval=self.sink_update_interval,
                 block_index=block_index,
+                current_frame_start=current_start_frame,
                 current_num_frames=current_num_frames,
                 frame_seq_length=self.frame_seq_length,
                 sink_size_frames=self.sink_size_frames,
                 kv_cache=self.kv_cache1,
                 prope_kv_cache=self.prope_kv_cache1,
+                kv_bank=self.kv_bank,
+                branch="main",
+                current_viewmats=vm_chunk,
+                current_Ks=ks_chunk,
+                recent_frames=self.retrieval_recent_frames,
+                fov_samples=self.retrieval_fov_samples,
+                fov_radius=self.retrieval_fov_radius,
+                fov_h_deg=self.retrieval_fov_h_deg,
+                fov_v_deg=self.retrieval_fov_v_deg,
+                hybrid_fov_weight=self.retrieval_hybrid_fov_weight,
+                random_seed=self.sink_bank_seed,
+                prope_reencode_mode=self.prope_reencode_mode,
                 label="causal",
             )
             if should_log_cache(self.log_cache_state, block_index, self.log_cache_interval):

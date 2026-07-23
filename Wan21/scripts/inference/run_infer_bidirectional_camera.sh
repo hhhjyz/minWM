@@ -12,16 +12,14 @@ CHECKPOINT_PATH="${CHECKPOINT_PATH:-./ckpts/Wan21/Action2V/bidirectional/model.p
 DATA_PATH="${DATA_PATH:-Wan21/prompts/demos.txt}"
 OUTPUT_FOLDER="${OUTPUT_FOLDER:-output/bidirectional_camera}"
 SP_SIZE="${SP_SIZE:-1}"
+SEED="${SEED:-0}"
 
 # ===== Camera Trajectory =====
 TRAJECTORY="${TRAJECTORY:-w*19}"
 TRAJECTORY_PATH="${TRAJECTORY_PATH:-}"
-TRAJECTORY_POSE_PATH="${TRAJECTORY_POSE_PATH:-}"
 
 # Build trajectory argument
-if [ -n "$TRAJECTORY_POSE_PATH" ]; then
-  TRAJ_ARGS="--trajectory_pose_path $TRAJECTORY_POSE_PATH"
-elif [ -n "$TRAJECTORY_PATH" ]; then
+if [ -n "$TRAJECTORY_PATH" ]; then
   TRAJ_ARGS="--trajectory_path $TRAJECTORY_PATH"
 else
   TRAJ_ARGS="--trajectory $TRAJECTORY"
@@ -37,7 +35,8 @@ echo "=== Inference: Bidirectional Camera Control ==="
 echo "  Config:     $CONFIG_PATH"
 echo "  Checkpoint: $CHECKPOINT_PATH"
 echo "  Output:     $OUTPUT_FOLDER"
-echo "  Pose path:  ${TRAJECTORY_POSE_PATH:-<trajectory-string-mode>}"
+echo "  Seed:       $SEED"
+echo "  Trajectory: ${TRAJECTORY_PATH:-$TRAJECTORY}"
 
 export SP_SIZE=$SP_SIZE
 torchrun \
@@ -51,5 +50,6 @@ torchrun \
   --output_folder "$OUTPUT_FOLDER" \
   --checkpoint_path "$CHECKPOINT_PATH" \
   --data_path "$DATA_PATH" \
+  --seed "$SEED" \
   --sp_size $SP_SIZE \
   $TRAJ_ARGS

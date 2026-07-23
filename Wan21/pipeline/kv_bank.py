@@ -37,6 +37,8 @@ class KVBankBlock:
     pose_summary: Optional[dict[str, float]]
     storage_bytes: int
     stored_compressed: bool = False
+    compression_keep_ratio: Optional[float] = None
+    motion_score: Optional[float] = None
 
 
 def _tensor_bytes(tensor: Optional[torch.Tensor]) -> int:
@@ -47,6 +49,121 @@ def _tensor_bytes(tensor: Optional[torch.Tensor]) -> int:
 
 def _copy_tensor(tensor: torch.Tensor, device: torch.device) -> torch.Tensor:
     return tensor.detach().to(device=device).clone()
+
+
+def normalize_prope_reencode_mode(mode: str) -> str:
+    mode = str(mode or "none").lower().strip()
+    if mode not in {"none", "current"}:
+        raise ValueError(f"Unknown prope_reencode_mode={mode!r}; expected none/current")
+    return mode
+
+
+def _lift_K(Ks: torch.Tensor) -> torch.Tensor:
+    out = torch.zeros(Ks.shape[:-2] + (4, 4), device=Ks.device, dtype=Ks.dtype)
+    out[..., :3, :3] = Ks
+    out[..., 3, 3] = 1.0
+    return out
+
+
+def _invert_K(Ks: torch.Tensor) -> torch.Tensor:
+    out = torch.zeros_like(Ks)
+    out[..., 0, 0] = 1.0 / Ks[..., 0, 0]
+    out[..., 1, 1] = 1.0 / Ks[..., 1, 1]
+    out[..., 0, 2] = -Ks[..., 0, 2] / Ks[..., 0, 0]
+    out[..., 1, 2] = -Ks[..., 1, 2] / Ks[..., 1, 1]
+    out[..., 2, 2] = 1.0
+    return out
+
+
+def _invert_SE3(viewmats: torch.Tensor) -> torch.Tensor:
+    out = torch.zeros_like(viewmats)
+    Rinv = viewmats[..., :3, :3].transpose(-1, -2)
+    out[..., :3, :3] = Rinv
+    out[..., :3, 3] = -torch.einsum("...ij,...j->...i", Rinv, viewmats[..., :3, 3])
+    out[..., 3, 3] = 1.0
+    return out
+
+
+def _camera_projection_pair(viewmats: torch.Tensor, Ks: Optional[torch.Tensor]):
+    viewmats = viewmats.float()
+    if Ks is not None:
+        Ks = Ks.float().to(device=viewmats.device)
+        Ks_norm = torch.zeros_like(Ks)
+        Ks_norm[..., 0, 0] = Ks[..., 0, 0]
+        Ks_norm[..., 1, 1] = Ks[..., 1, 1]
+        Ks_norm[..., 2, 2] = 1.0
+        P = torch.einsum("...ij,...jk->...ik", _lift_K(Ks_norm), viewmats)
+        P_inv = torch.einsum("...ij,...jk->...ik", _invert_SE3(viewmats), _lift_K(_invert_K(Ks_norm)))
+    else:
+        P = viewmats
+        P_inv = _invert_SE3(viewmats)
+    return P, P_inv
+
+
+def _apply_camera_matrix_to_prope(feats: torch.Tensor, matrix: torch.Tensor) -> torch.Tensor:
+    """Apply a per-camera 4x4 PRoPE matrix to [B, tokens, heads, dim]."""
+    batch, tokens, heads, dim = feats.shape
+    cameras = matrix.shape[1]
+    if tokens < cameras or tokens % cameras != 0 or dim % 4 != 0:
+        return feats
+    feats_bhld = feats.permute(0, 2, 1, 3)
+    out = torch.einsum(
+        "bcij,bhcpkj->bhcpki",
+        matrix.to(device=feats.device, dtype=feats.dtype),
+        feats_bhld.reshape(batch, heads, cameras, -1, dim // 4, 4),
+    ).reshape(feats_bhld.shape)
+    return out.permute(0, 2, 1, 3)
+
+
+def reencode_prope_kv_to_current(
+    prope_k: torch.Tensor,
+    prope_v: torch.Tensor,
+    *,
+    src_viewmats: Optional[torch.Tensor],
+    src_Ks: Optional[torch.Tensor],
+    dst_viewmats: Optional[torch.Tensor],
+    dst_Ks: Optional[torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor, bool]:
+    """Re-encode PRoPE KV from source camera poses to current camera poses.
+
+    Stored PRoPE KV is approximately ``P_src_inv @ raw_kv``. Re-encoding uses
+    ``P_dst_inv @ P_src @ stored_kv``. The operation is only applied when the
+    source and destination camera counts match and token layout is frame-regular.
+    """
+    if src_viewmats is None or dst_viewmats is None:
+        return prope_k, prope_v, False
+    src_viewmats = src_viewmats.detach().float()
+    dst_viewmats = dst_viewmats.detach().float()
+    if src_viewmats.ndim == 3:
+        src_viewmats = src_viewmats.unsqueeze(0)
+    if dst_viewmats.ndim == 3:
+        dst_viewmats = dst_viewmats.unsqueeze(0)
+    if src_viewmats.shape[:2] != dst_viewmats.shape[:2]:
+        return prope_k, prope_v, False
+    if prope_k.shape[1] % src_viewmats.shape[1] != 0:
+        return prope_k, prope_v, False
+
+    src_Ks = src_Ks.detach().float() if src_Ks is not None else None
+    dst_Ks = dst_Ks.detach().float() if dst_Ks is not None else None
+    if src_Ks is not None and src_Ks.ndim == 3:
+        src_Ks = src_Ks.unsqueeze(0)
+    if dst_Ks is not None and dst_Ks.ndim == 3:
+        dst_Ks = dst_Ks.unsqueeze(0)
+    if (src_Ks is None) != (dst_Ks is None):
+        return prope_k, prope_v, False
+    if src_Ks is not None and src_Ks.shape[:2] != src_viewmats.shape[:2]:
+        return prope_k, prope_v, False
+    if dst_Ks is not None and dst_Ks.shape[:2] != dst_viewmats.shape[:2]:
+        return prope_k, prope_v, False
+
+    src_P, _ = _camera_projection_pair(src_viewmats, src_Ks)
+    _, dst_P_inv = _camera_projection_pair(dst_viewmats, dst_Ks)
+    transform = torch.einsum("...ij,...jk->...ik", dst_P_inv, src_P)
+    return (
+        _apply_camera_matrix_to_prope(prope_k, transform),
+        _apply_camera_matrix_to_prope(prope_v, transform),
+        True,
+    )
 
 
 def _latest_cache_slice(cache: dict, token_count: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -184,6 +301,12 @@ class KVBank:
         compression_keep_ratio: float = 0.5,
         compression_at_store: bool = False,
         compression_pooled: bool = False,
+        compression_dynamic_enable: bool = False,
+        compression_dynamic_min_keep: float = 0.25,
+        compression_dynamic_max_keep: float = 0.75,
+        compression_dynamic_translation_scale: float = 1.0,
+        compression_dynamic_rotation_scale: float = 0.35,
+        compression_dynamic_motion_weight: float = 0.25,
     ) -> None:
         if device not in {"cpu", "cuda"}:
             raise ValueError(f"Unsupported KV bank device: {device!r}")
@@ -196,6 +319,12 @@ class KVBank:
         self.compression_keep_ratio = float(compression_keep_ratio)
         self.compression_at_store = bool(compression_at_store)
         self.compression_pooled = bool(compression_pooled)
+        self.compression_dynamic_enable = bool(compression_dynamic_enable)
+        self.compression_dynamic_min_keep = float(compression_dynamic_min_keep)
+        self.compression_dynamic_max_keep = float(compression_dynamic_max_keep)
+        self.compression_dynamic_translation_scale = max(1e-6, float(compression_dynamic_translation_scale))
+        self.compression_dynamic_rotation_scale = max(1e-6, float(compression_dynamic_rotation_scale))
+        self.compression_dynamic_motion_weight = float(compression_dynamic_motion_weight)
         self.blocks: list[KVBankBlock] = []
         self.total_bytes = 0
         self.evicted_blocks = 0
@@ -214,6 +343,21 @@ class KVBank:
 
     def _storage_device(self, source_device: torch.device) -> torch.device:
         return source_device if self.device_name == "cuda" else torch.device("cpu")
+
+    def _effective_keep_ratio(self, pose_summary: Optional[dict[str, float]]) -> tuple[float, Optional[float]]:
+        base = float(self.compression_keep_ratio)
+        if not self.compression_dynamic_enable or pose_summary is None:
+            return base, None
+
+        translation = float(pose_summary.get("translation_delta", 0.0))
+        rotation = float(pose_summary.get("rotation_delta_rad", 0.0))
+        motion_score = (
+            translation / self.compression_dynamic_translation_scale
+            + rotation / self.compression_dynamic_rotation_scale
+        )
+        keep_ratio = base - self.compression_dynamic_motion_weight * motion_score
+        keep_ratio = min(self.compression_dynamic_max_keep, max(self.compression_dynamic_min_keep, keep_ratio))
+        return keep_ratio, motion_score
 
     def append_block(
         self,
@@ -244,6 +388,8 @@ class KVBank:
             self.evicted_blocks += 1
         stored_branches = {}
         block_bytes = 0
+        stored_viewmats, stored_Ks, pose_summary = _camera_metadata(viewmats, Ks)
+        effective_keep_ratio, motion_score = self._effective_keep_ratio(pose_summary)
 
         for branch_name, (normal_cache, prope_cache) in cache_branches.items():
             if prope_cache is not None and len(prope_cache) != len(normal_cache):
@@ -260,7 +406,7 @@ class KVBank:
                         v_source,
                         chunk_size=frame_count,
                         frame_seq_length=frame_seq_length,
-                        keep_ratio=self.compression_keep_ratio,
+                        keep_ratio=effective_keep_ratio,
                         anchor_rotate=False,
                         pooled=self.compression_pooled,
                     )
@@ -278,7 +424,7 @@ class KVBank:
                             prope_v_source,
                             chunk_size=frame_count,
                             frame_seq_length=frame_seq_length,
-                            keep_ratio=self.compression_keep_ratio,
+                            keep_ratio=effective_keep_ratio,
                             anchor_rotate=False,
                             pooled=self.compression_pooled,
                         )
@@ -292,7 +438,6 @@ class KVBank:
                 layers.append(entry)
             stored_branches[branch_name] = layers
 
-        stored_viewmats, stored_Ks, pose_summary = _camera_metadata(viewmats, Ks)
         block_bytes += _tensor_bytes(stored_viewmats) + _tensor_bytes(stored_Ks)
         block = KVBankBlock(
             block_id=int(block_id),
@@ -305,6 +450,8 @@ class KVBank:
             pose_summary=pose_summary,
             storage_bytes=block_bytes,
             stored_compressed=self.compression_enable and self.compression_at_store,
+            compression_keep_ratio=effective_keep_ratio if self.compression_enable and self.compression_at_store else None,
+            motion_score=motion_score,
         )
 
         self.blocks.append(block)
@@ -340,7 +487,9 @@ class KVBank:
             print(
                 f"[kv-bank] block={block.block_id} frames={block.frame_start}:{block.frame_end} "
                 f"tokens={block.token_count} blocks={len(self.blocks)} "
-                f"total_gb={self.total_bytes / 1024 ** 3:.3f} evicted={self.evicted_blocks}",
+                f"total_gb={self.total_bytes / 1024 ** 3:.3f} evicted={self.evicted_blocks} "
+                f"keep_ratio={block.compression_keep_ratio if block.compression_keep_ratio is not None else 'none'} "
+                f"motion_score={block.motion_score if block.motion_score is not None else 'none'}",
                 flush=True,
             )
 
@@ -367,6 +516,9 @@ class KVBank:
         compression_pooled: bool = False,
         frame_seq_length: int = 1560,
         rope_correction: bool = False,
+        prope_reencode_mode: str = "none",
+        current_viewmats: Optional[torch.Tensor] = None,
+        current_Ks: Optional[torch.Tensor] = None,
     ) -> Optional[dict[str, torch.Tensor | list[int] | bool | int]]:
         if not selected_block_indices:
             return None
@@ -384,19 +536,34 @@ class KVBank:
             "compress_chunk_size": self.blocks[selected_block_indices[0]].frame_end - self.blocks[selected_block_indices[0]].frame_start,
             "stored_compressed": all(self.blocks[index].stored_compressed for index in selected_block_indices),
             "rope_correction": bool(rope_correction),
+            "prope_reencode_mode": normalize_prope_reencode_mode(prope_reencode_mode),
+            "prope_reencoded": False,
         }
 
         if include_prope and all(entry.prope_k is not None and entry.prope_v is not None for entry in entries):
-            prope_k_parts = [
-                entry.prope_k.to(device=device) if device is not None else entry.prope_k
-                for entry in entries
-            ]
-            prope_v_parts = [
-                entry.prope_v.to(device=device) if device is not None else entry.prope_v
-                for entry in entries
-            ]
+            prope_k_parts = []
+            prope_v_parts = []
+            reencoded_any = False
+            mode = normalize_prope_reencode_mode(prope_reencode_mode)
+            for block_index, entry in zip(selected_block_indices, entries):
+                prope_k = entry.prope_k.to(device=device) if device is not None else entry.prope_k
+                prope_v = entry.prope_v.to(device=device) if device is not None else entry.prope_v
+                block = self.blocks[block_index]
+                if mode == "current" and not block.stored_compressed:
+                    prope_k, prope_v, did_reencode = reencode_prope_kv_to_current(
+                        prope_k,
+                        prope_v,
+                        src_viewmats=block.viewmats,
+                        src_Ks=block.Ks,
+                        dst_viewmats=current_viewmats,
+                        dst_Ks=current_Ks,
+                    )
+                    reencoded_any = reencoded_any or did_reencode
+                prope_k_parts.append(prope_k)
+                prope_v_parts.append(prope_v)
             payload["prope_k"] = torch.cat(prope_k_parts, dim=1)
             payload["prope_v"] = torch.cat(prope_v_parts, dim=1)
+            payload["prope_reencoded"] = reencoded_any
 
         if compress_runtime and not payload["stored_compressed"]:
             chunk_size = int(payload["chunk_size_frames"])
@@ -514,6 +681,9 @@ class KVBank:
         compression_pooled: bool,
         frame_seq_length: int,
         rope_correction: bool = False,
+        prope_reencode_mode: str = "none",
+        current_viewmats: Optional[torch.Tensor] = None,
+        current_Ks: Optional[torch.Tensor] = None,
     ) -> Optional[list[dict[str, torch.Tensor | list[int] | bool | int]]]:
         if not selected_block_indices:
             return None
@@ -535,6 +705,9 @@ class KVBank:
                 compression_pooled=compression_pooled,
                 frame_seq_length=frame_seq_length,
                 rope_correction=rope_correction,
+                prope_reencode_mode=prope_reencode_mode,
+                current_viewmats=current_viewmats,
+                current_Ks=current_Ks,
             )
             if payload is None:
                 return None
@@ -556,4 +729,10 @@ class KVBank:
             "compression_at_store": self.compression_at_store,
             "compression_keep_ratio": self.compression_keep_ratio,
             "compression_pooled": self.compression_pooled,
+            "compression_dynamic_enable": self.compression_dynamic_enable,
+            "compression_dynamic_min_keep": self.compression_dynamic_min_keep,
+            "compression_dynamic_max_keep": self.compression_dynamic_max_keep,
+            "compression_dynamic_translation_scale": self.compression_dynamic_translation_scale,
+            "compression_dynamic_rotation_scale": self.compression_dynamic_rotation_scale,
+            "compression_dynamic_motion_weight": self.compression_dynamic_motion_weight,
         }

@@ -13,6 +13,7 @@ DATA_PATH="${DATA_PATH:-Wan21/prompts/demos.txt}"
 OUTPUT_FOLDER="${OUTPUT_FOLDER:-output/ar_camera}"
 SP_SIZE="${SP_SIZE:-1}"
 NUM_OUTPUT_FRAMES="${NUM_OUTPUT_FRAMES:-20}"
+SEED="${SEED:-0}"
 MAX_PROMPTS="${MAX_PROMPTS:--1}"
 PROMPT_START="${PROMPT_START:-0}"
 LOG_CACHE_STATE="${LOG_CACHE_STATE:-0}"
@@ -20,16 +21,15 @@ LOG_CACHE_INTERVAL="${LOG_CACHE_INTERVAL:-1}"
 SINK_STRATEGY="${SINK_STRATEGY:-none}"
 SINK_SIZE="${SINK_SIZE:-0}"
 SINK_UPDATE_INTERVAL="${SINK_UPDATE_INTERVAL:-0}"
+SINK_BANK_SEED="${SINK_BANK_SEED:-0}"
+PROPE_REENCODE_MODE="${PROPE_REENCODE_MODE:-none}"
 
 # ===== Camera Trajectory =====
 TRAJECTORY="${TRAJECTORY:-w*19}"
 TRAJECTORY_PATH="${TRAJECTORY_PATH:-}"
-TRAJECTORY_POSE_PATH="${TRAJECTORY_POSE_PATH:-}"
 
 # Build trajectory argument
-if [ -n "$TRAJECTORY_POSE_PATH" ]; then
-  TRAJ_ARGS="--trajectory_pose_path $TRAJECTORY_POSE_PATH"
-elif [ -n "$TRAJECTORY_PATH" ]; then
+if [ -n "$TRAJECTORY_PATH" ]; then
   TRAJ_ARGS="--trajectory_path $TRAJECTORY_PATH"
 else
   TRAJ_ARGS="--trajectory $TRAJECTORY"
@@ -50,9 +50,10 @@ echo "=== Inference: AR Camera Control ==="
 echo "  Config:     $CONFIG_PATH"
 echo "  Checkpoint: $CHECKPOINT_PATH"
 echo "  Output:     $OUTPUT_FOLDER"
-echo "  Subset:     start=$PROMPT_START max=$MAX_PROMPTS frames=$NUM_OUTPUT_FRAMES"
-echo "  Pose path:  ${TRAJECTORY_POSE_PATH:-<trajectory-string-mode>}"
-echo "  Sink:       strategy=$SINK_STRATEGY size=$SINK_SIZE update_interval=$SINK_UPDATE_INTERVAL"
+echo "  Subset:     start=$PROMPT_START max=$MAX_PROMPTS frames=$NUM_OUTPUT_FRAMES seed=$SEED"
+echo "  Trajectory: ${TRAJECTORY_PATH:-$TRAJECTORY}"
+echo "  Sink:       strategy=$SINK_STRATEGY size=$SINK_SIZE update_interval=$SINK_UPDATE_INTERVAL bank_seed=$SINK_BANK_SEED"
+echo "  PRoPE:      reencode_mode=$PROPE_REENCODE_MODE"
 
 export SP_SIZE=$SP_SIZE
 torchrun \
@@ -67,11 +68,14 @@ torchrun \
   --checkpoint_path "$CHECKPOINT_PATH" \
   --data_path "$DATA_PATH" \
   --num_output_frames "$NUM_OUTPUT_FRAMES" \
+  --seed "$SEED" \
   --max_prompts "$MAX_PROMPTS" \
   --prompt_start "$PROMPT_START" \
   --sink_strategy "$SINK_STRATEGY" \
   --sink_size "$SINK_SIZE" \
   --sink_update_interval "$SINK_UPDATE_INTERVAL" \
+  --sink_bank_seed "$SINK_BANK_SEED" \
   --sp_size $SP_SIZE \
+  --prope_reencode_mode "$PROPE_REENCODE_MODE" \
   $LOG_ARGS \
   $TRAJ_ARGS

@@ -1,5 +1,191 @@
 # minWM + WorldKV + FOV 检索路线规划
 
+## 运行参数速查
+
+下面这些参数都可以作为环境变量写在命令前面，例如：
+
+```bash
+cd /pool/hdd/home/hhhjyz/research/minWM
+
+SAMPLES_PER_BUCKET=8 \
+NUM_OUTPUT_FRAMES=120 \
+SEEDS="0" \
+CASES="baseline fixed_sink periodic_sink pose_compress_store worldkv_fov_compress_store worldkv_fov_dynamic_compress_store" \
+RUN_ROOT=./outputs/viewbench_large24_official_vbench_120f \
+bash Wan21/scripts/inference/run_viewbench_large_with_official_vbench.sh
+```
+
+### 大规模 ViewBench + 官方 VBench 一体化脚本
+
+入口：
+
+```bash
+bash Wan21/scripts/inference/run_viewbench_large_with_official_vbench.sh
+```
+
+这个脚本会先构造 ViewBench prompt/pose 子集，然后运行实验矩阵，并在每个 case 生成完成后自动调用官方 VBench 评测。
+
+| 参数 | 默认值 | 作用 |
+|---|---|---|
+| `PYTHON_BIN` | `/pool/hdd/home/hhhjyz/miniconda3/envs/ling/bin/python` | minWM 侧脚本使用的 Python，一般用 `ling` 环境。 |
+| `VIEWBENCH_DATASET_ROOT` | `/pool/hdd/home/hhhjyz/research/datasets/ViewBench4Training` | 已解压的 ViewBench 数据目录。 |
+| `OFFICIAL_VBENCH_ROOT` | `/pool/hdd/home/hhhjyz/research/VBench` | 官方 VBench 仓库路径。 |
+| `OFFICIAL_VBENCH_PYTHON` | `/home/hhhjyz/miniconda3/envs/vbench/bin/python` | 官方 VBench 独立环境 Python。 |
+| `SAMPLES_PER_BUCKET` | `8` | 每类 ViewBench 采样数量；总样本数约为 `3 * SAMPLES_PER_BUCKET`。 |
+| `VIEWBENCH_MAX_POSE_FRAMES` | `360` | 构造 pose 子集时每条轨迹最多保留多少帧。 |
+| `VIEWBENCH_PROMPT_DIR` | `Wan21/prompts/viewbench_large_$((SAMPLES_PER_BUCKET * 3))` | 生成的 prompt/pose/manifest 保存目录。 |
+| `SKIP_BUILD_VIEWBENCH_PROMPTS` | `0` | 设为 `1` 时跳过数据子集构造，直接复用已有 `VIEWBENCH_PROMPT_DIR`。 |
+| `RUN_ROOT` | `./outputs/viewbench_large_${SAMPLES_PER_BUCKET}x3_<timestamp>` | 本次实验输出根目录。 |
+| `MAX_PROMPTS` | `3 * SAMPLES_PER_BUCKET` | 本次实际推理的 prompt 数量。 |
+| `NUM_OUTPUT_FRAMES` | `120` | 每条视频生成帧数；建议使用 4 的倍数。 |
+| `SEEDS` | `0` | 随机种子列表，例如 `"0 1 2"`。 |
+| `CASES` | `baseline fixed_sink periodic_sink pose_compress_store worldkv_fov_compress_store worldkv_fov_dynamic_compress_store` | 要运行的实验 case。 |
+| `OFFICIAL_VBENCH_DIMENSIONS` | `subject_consistency background_consistency temporal_flickering motion_smoothness aesthetic_quality imaging_quality` | 官方 VBench 维度。默认不跑 `dynamic_degree`。 |
+| `EVAL_ENABLE` | `1` | 是否启用评测阶段。 |
+| `EVAL_DEVICE` | `cuda` | ViewBench/轻量评测使用设备。 |
+| `EVAL_VBENCH_STYLE_ENABLE` | `0` | 是否额外跑本项目的 VBench-style proxy 指标。 |
+| `EVAL_OFFICIAL_VBENCH_ENABLE` | `1` | 是否自动跑官方 VBench。 |
+| `CONTINUE_ON_ERROR` | `1` | 单个 case 失败后是否继续跑后续 case。 |
+| `DRY_RUN` | `0` | 设为 `1` 时只打印将要运行的命令，不真正推理。 |
+| `SKIP_COMPLETED` | `1` | 设为 `1` 时跳过已完成推理和已有评测结果，适合断点续跑。 |
+
+推荐大规模实验命令：
+
+```bash
+cd /pool/hdd/home/hhhjyz/research/minWM
+
+SAMPLES_PER_BUCKET=8 \
+NUM_OUTPUT_FRAMES=120 \
+SEEDS="0" \
+CASES="baseline fixed_sink periodic_sink pose_compress_store worldkv_fov_compress_store worldkv_fov_dynamic_compress_store" \
+RUN_ROOT=./outputs/viewbench_large24_official_vbench_120f \
+SKIP_COMPLETED=1 \
+bash Wan21/scripts/inference/run_viewbench_large_with_official_vbench.sh
+```
+
+如果想扩大到 48 条样本：
+
+```bash
+cd /pool/hdd/home/hhhjyz/research/minWM
+
+SAMPLES_PER_BUCKET=16 \
+NUM_OUTPUT_FRAMES=120 \
+SEEDS="0" \
+CASES="baseline fixed_sink periodic_sink pose_compress_store worldkv_fov_compress_store worldkv_fov_dynamic_compress_store" \
+RUN_ROOT=./outputs/viewbench_large48_official_vbench_120f \
+SKIP_COMPLETED=1 \
+bash Wan21/scripts/inference/run_viewbench_large_with_official_vbench.sh
+```
+
+输出文件：
+
+```text
+RUN_ROOT/experiment_manifest.txt
+RUN_ROOT/experiment_summary.tsv
+RUN_ROOT/seed_<seed>/<case>/inference_times.csv
+RUN_ROOT/seed_<seed>/<case>/eval/official_vbench_metrics.csv
+RUN_ROOT/official_vbench_report/official_vbench_summary.csv
+RUN_ROOT/official_vbench_report/official_vbench_report.tex
+```
+
+### 实验矩阵脚本
+
+入口：
+
+```bash
+bash Wan21/scripts/inference/run_viewbench_worldkv_fov_experiments.sh
+```
+
+这个脚本不构造数据集，直接使用已有 prompt/pose/manifest 运行实验矩阵。它也支持生成后自动评测。
+
+| 参数 | 默认值 | 作用 |
+|---|---|---|
+| `RUN_ROOT` | `./outputs/viewbench_worldkv_fov_<timestamp>` | 输出根目录。 |
+| `DATA_PATH` | `Wan21/prompts/viewbench_small12/prompts.txt` | prompt 文件。 |
+| `TRAJECTORY_POSE_PATH` | `Wan21/prompts/viewbench_small12/trajectory_pose_paths.txt` | pose `.npz` 路径列表。 |
+| `VIEWBENCH_MANIFEST` | `Wan21/prompts/viewbench_small12/manifest.json` | ViewBench manifest，用于参考指标。 |
+| `CHECKPOINT_PATH` | `/pool/hdd/home/hhhjyz/research/ckpts/Wan21/Action2V/dmd/model.pt` | minWM DMD checkpoint。 |
+| `CONFIG_PATH` | `Wan21/configs/causal_forcing_dmd_camera.yaml` | 推理配置。 |
+| `PYTHON_BIN` | `python`，找不到时 fallback 到 `python3` | minWM 侧评测脚本 Python。 |
+| `MAX_PROMPTS` | `5` | 推理样本数。 |
+| `PROMPT_START` | `0` | 从第几个 prompt 开始。 |
+| `NUM_OUTPUT_FRAMES` | `120` | 每条视频生成帧数。 |
+| `SEEDS` | `0` | seed 列表。 |
+| `CASES` | 默认 5 组主实验 | 指定 case 列表。 |
+| `DRY_RUN` | `0` | 只打印命令，不运行。 |
+| `SKIP_COMPLETED` | `0` | 跳过已有完整推理和评测；大规模 wrapper 默认设为 `1`。 |
+| `CONTINUE_ON_ERROR` | `1` | 失败后继续后续 case。 |
+
+可用 case：
+
+```text
+baseline
+fixed_sink
+periodic_sink
+bank_random_sink
+bank_uniform_sink
+bank_pose_sink
+bank_worldkv_fov_sink
+kv_bank_only
+pose
+pose_rope
+worldkv_fov
+hy_fov
+hybrid
+pose_compress_store
+worldkv_fov_compress_store
+worldkv_fov_dynamic_compress_store
+```
+
+### Sink / KV Bank / Retrieval 参数
+
+| 参数 | 默认值 | 作用 |
+|---|---|---|
+| `SINK_SIZE` | `4` | sink frame 数。 |
+| `SINK_UPDATE_INTERVAL` | `4` | periodic 或 bank sink 每隔多少 block 更新一次。 |
+| `SINK_BANK_SEED` | `0` | bank random sink 的随机种子。 |
+| `KV_BANK_DEVICE` | `cpu` | KV bank 存储设备。 |
+| `KV_BANK_MAX_BLOCKS` | `45` | KV bank 最多保留多少 block。 |
+| `KV_BANK_WARN_MEMORY_GB` | `128` | KV bank 内存告警阈值。 |
+| `KV_BANK_LOG_INTERVAL` | `1` | KV bank 日志间隔。 |
+| `RETRIEVAL_FRAMES` | `12` | 每次检索取回多少历史 frame。 |
+| `RETRIEVAL_RECENT_FRAMES` | `32` | 检索时排除最近多少 frame，避免只取近邻。 |
+| `RETRIEVAL_FOV_SAMPLES` | `8192` | FOV overlap 采样点数。 |
+| `RETRIEVAL_FOV_RADIUS` | `8.0` | FOV overlap 几何采样半径。 |
+| `RETRIEVAL_FOV_H_DEG` | `60.0` | 水平视场角。 |
+| `RETRIEVAL_FOV_V_DEG` | `35.0` | 垂直视场角。 |
+| `RETRIEVAL_HYBRID_FOV_WEIGHT` | `0.5` | hybrid metric 中 FOV 分量权重。 |
+| `PROPE_REENCODE_MODE` | `none` | prope 重编码策略。 |
+
+### KV Compression / 动态剪枝参数
+
+| 参数 | 默认值 | 作用 |
+|---|---|---|
+| `KV_COMPRESSION_KEEP_RATIO` | `0.5` | 静态压缩保留比例。 |
+| `KV_COMPRESSION_DYNAMIC_MIN_KEEP` | `0.25` | 动态剪枝最小保留比例。 |
+| `KV_COMPRESSION_DYNAMIC_MAX_KEEP` | `0.75` | 动态剪枝最大保留比例。 |
+| `KV_COMPRESSION_DYNAMIC_TRANSLATION_SCALE` | `1.0` | 平移幅度归一化尺度。 |
+| `KV_COMPRESSION_DYNAMIC_ROTATION_SCALE` | `0.35` | 旋转幅度归一化尺度，单位 rad。 |
+| `KV_COMPRESSION_DYNAMIC_MOTION_WEIGHT` | `0.25` | 相机运动幅度对 keep ratio 的影响权重。 |
+
+### Profiling / 评测参数
+
+| 参数 | 默认值 | 作用 |
+|---|---|---|
+| `LOG_CACHE_STATE` | `0` | 是否记录 cache/KV 状态。 |
+| `LOG_CACHE_INTERVAL` | `1` | cache 状态日志间隔。 |
+| `EVAL_ENABLE` | `1` | 是否启用评测。 |
+| `EVAL_DEVICE` | `cuda` | 轻量评测设备。 |
+| `EVAL_PAIR_RADIUS` | `0` | ViewBench reference pair 半径。 |
+| `EVAL_VBENCH_STYLE_ENABLE` | `1` | 是否运行项目内 VBench-style proxy；大规模 wrapper 默认关。 |
+| `EVAL_VBENCH_STYLE_MAX_FRAMES` | `96` | VBench-style 最多采样帧数。 |
+| `EVAL_VBENCH_STYLE_RESIZE_WIDTH` | `256` | VBench-style 评测 resize 宽度。 |
+| `EVAL_OFFICIAL_VBENCH_ENABLE` | `0` | 是否运行官方 VBench；大规模 wrapper 默认开。 |
+| `OFFICIAL_VBENCH_ROOT` | 空 | 官方 VBench 仓库路径。 |
+| `OFFICIAL_VBENCH_PYTHON` | `python` | 官方 VBench 环境 Python。 |
+| `OFFICIAL_VBENCH_LONG` | `0` | 是否使用 VBench-Long 入口。 |
+| `OFFICIAL_VBENCH_DIMENSIONS` | 空，使用 adapter 默认维度 | 官方 VBench 维度列表。 |
+
 ## 目标
 
 建立一条适合单卡 A100 40G 的 world memory 实验路线：
@@ -225,21 +411,177 @@ head -n 1 Wan21/prompts/trajectories.txt > Wan21/prompts/trajectories_1.txt
 
 ### ViewBench small12 评测
 
-推理完成后，使用轻量评测脚本计算 loop-closure 帧对的一致性：
+#### 推荐命令：已有结果单独评测
+
+如果已经有某个 case 的推理结果，例如：
+
+```text
+./outputs/viewbench_worldkv_fov_a10080_five_cases_120f/seed_0/baseline/
+```
+
+先在 `ling` 环境下跑 loop-closure 指标：
 
 ```bash
+cd /pool/hdd/home/hhhjyz/research/minWM
+conda activate ling
+
 python Wan21/scripts/evaluation/evaluate_viewbench_small.py \
   --manifest Wan21/prompts/viewbench_small12/manifest.json \
-  --timing-csv ./outputs/profile_viewbench_small12/inference_times.csv \
-  --output-dir ./outputs/profile_viewbench_small12/eval
+  --timing-csv ./outputs/viewbench_worldkv_fov_a10080_five_cases_120f/seed_0/baseline/inference_times.csv \
+  --output-dir ./outputs/viewbench_worldkv_fov_a10080_five_cases_120f/seed_0/baseline/eval \
+  --device cuda
+```
+
+再跑 VBench-style 无参考视频质量 proxy：
+
+```bash
+cd /pool/hdd/home/hhhjyz/research/minWM
+conda activate ling
+
+python Wan21/scripts/evaluation/evaluate_vbench_style.py \
+  --timing-csv ./outputs/viewbench_worldkv_fov_a10080_five_cases_120f/seed_0/baseline/inference_times.csv \
+  --output-dir ./outputs/viewbench_worldkv_fov_a10080_five_cases_120f/seed_0/baseline/eval \
+  --max-frames 96 \
+  --resize-width 256
 ```
 
 输出：
 
 - `viewbench_metrics.csv`：每个视频的 PSNR、SSIM、LPIPS、last-chunk FPS、峰值显存。
 - `viewbench_metrics.json`：平均指标和评测说明。
+- `vbench_style_metrics.csv`：每个视频的无参考视频质量指标。
+- `vbench_style_metrics.json`：平均无参考指标和解释说明。
 
 LPIPS 依赖 `lpips` 包；如果当前环境没有安装，脚本会跳过 LPIPS 并保留 PSNR/SSIM/FPS。FID 暂不在轻量评测中计算，因为没有明确参考分布时，FID 对当前生成式 loop-closure 对比的解释性较弱。
+
+#### 推荐命令：推理后自动评测
+
+矩阵脚本 `run_viewbench_worldkv_fov_experiments.sh` 默认会在每个 case 推理成功后自动运行：
+
+- `evaluate_viewbench_small.py`
+- `evaluate_vbench_style.py`
+
+因此最常用的一键命令是：
+
+```bash
+cd /pool/hdd/home/hhhjyz/research/minWM
+conda activate ling
+
+RUN_ROOT=./outputs/viewbench_worldkv_fov_a10080_five_cases_120f \
+SEEDS="0" \
+MAX_PROMPTS=12 \
+NUM_OUTPUT_FRAMES=120 \
+bash Wan21/scripts/inference/run_viewbench_worldkv_fov_experiments.sh
+```
+
+如果只想重新跑推理、不跑任何评测：
+
+```bash
+EVAL_ENABLE=0 \
+bash Wan21/scripts/inference/run_viewbench_worldkv_fov_experiments.sh
+```
+
+如果只想关闭 VBench-style proxy，但保留 ViewBench loop-closure 指标：
+
+```bash
+EVAL_VBENCH_STYLE_ENABLE=0 \
+bash Wan21/scripts/inference/run_viewbench_worldkv_fov_experiments.sh
+```
+
+VBench-style 轻量评测不使用 VBench 官方 prompt，也不声称是官方 leaderboard 分数。它直接读取我们自己的 `inference_times.csv` 和生成视频，计算不依赖文本 prompt 的内部对比指标。当前包含：
+
+- `frame_difference_mean`：相邻帧平均变化，反映整体动态程度。
+- `temporal_flicker_proxy`：二阶帧差，越低通常越稳定。
+- `motion_smoothness_proxy`：由 flicker proxy 转换得到，越高越平滑。
+- `dynamic_degree_proxy` / `optical_flow_mean`：稠密光流均值，作为动态程度近似。
+- `sharpness_laplacian_var`：Laplacian 方差，作为清晰度近似。
+- `brightness_mean`、`contrast_mean`、`black_frame_ratio`、`white_frame_ratio`：基础画面质量诊断。
+
+#### 可选命令：官方 VBench 质量维度
+
+如果已经安装官方 VBench，也可以使用官方指标入口。推荐先只跑 custom-input 较稳的质量维度，不需要 VBench prompt，也暂时不需要 detectron2：
+
+```bash
+cd /pool/hdd/home/hhhjyz/research/minWM
+conda activate ling
+
+python Wan21/scripts/evaluation/evaluate_vbench_official.py \
+  --timing-csv ./outputs/viewbench_worldkv_fov_a10080_five_cases_120f/seed_0/baseline/inference_times.csv \
+  --output-dir ./outputs/viewbench_worldkv_fov_a10080_five_cases_120f/seed_0/baseline/eval \
+  --vbench-root /path/to/VBench \
+  --python-bin /home/hhhjyz/miniconda3/envs/vbench/bin/python \
+  --dimensions subject_consistency background_consistency motion_smoothness dynamic_degree aesthetic_quality imaging_quality
+```
+
+VBench-Long：
+
+```bash
+cd /pool/hdd/home/hhhjyz/research/minWM
+conda activate ling
+
+python Wan21/scripts/evaluation/evaluate_vbench_official.py \
+  --timing-csv ./outputs/viewbench_worldkv_fov_a10080_five_cases_120f/seed_0/baseline/inference_times.csv \
+  --output-dir ./outputs/viewbench_worldkv_fov_a10080_five_cases_120f/seed_0/baseline/eval \
+  --vbench-root /path/to/VBench \
+  --python-bin /home/hhhjyz/miniconda3/envs/vbench/bin/python \
+  --long \
+  --dimensions subject_consistency background_consistency motion_smoothness dynamic_degree aesthetic_quality imaging_quality
+```
+
+如果希望矩阵脚本在每个 case 推理后自动调用官方 VBench：
+
+```bash
+cd /pool/hdd/home/hhhjyz/research/minWM
+conda activate ling
+
+EVAL_OFFICIAL_VBENCH_ENABLE=1 \
+OFFICIAL_VBENCH_ROOT=/path/to/VBench \
+OFFICIAL_VBENCH_PYTHON=/home/hhhjyz/miniconda3/envs/vbench/bin/python \
+OFFICIAL_VBENCH_DIMENSIONS="subject_consistency background_consistency motion_smoothness dynamic_degree aesthetic_quality imaging_quality" \
+bash Wan21/scripts/inference/run_viewbench_worldkv_fov_experiments.sh
+```
+
+默认官方 VBench 入口是关闭的，因为它需要额外依赖和模型权重。当前 Forcing-KV 的 `evaluation/VBench` 目录只是 wrapper 和总分脚本，不包含完整官方 VBench 仓库。
+
+官方 VBench 依赖建议单独建环境，不建议直接塞进当前 `ling` 推理环境：
+
+```bash
+conda create -n vbench python=3.10 -y
+conda activate vbench
+
+# 官方 README 推荐 CUDA <= 12.1 的 PyTorch 组合；示例使用 cu118。
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
+pip install vbench
+
+git clone https://github.com/Vchitect/VBench.git /path/to/VBench
+```
+
+`detectron2` 不是当前推荐质量维度的必需项，可以先不装。只有当你要跑对象/场景/语义检测类维度时再安装。若安装时报 `No module named 'torch'`，先确认当前 `vbench` 环境里能 `import torch`，然后使用：
+
+```bash
+conda activate vbench
+python -c "import torch; print(torch.__version__, torch.version.cuda)"
+pip install --no-build-isolation 'detectron2@git+https://github.com/facebookresearch/detectron2.git'
+```
+
+当前优先推荐官方 custom input 可较稳使用的维度：
+
+```text
+subject_consistency
+background_consistency
+motion_smoothness
+dynamic_degree
+aesthetic_quality
+imaging_quality
+```
+
+如果跑普通 VBench 并希望包含 `temporal_flickering`，可以额外加入：
+
+```bash
+OFFICIAL_VBENCH_DIMENSIONS="subject_consistency background_consistency temporal_flickering motion_smoothness dynamic_degree aesthetic_quality imaging_quality"
+```
+
+注意：`object_class`、`multiple_objects`、`color`、`spatial_relationship`、`scene`、`human_action` 等语义维度更依赖 VBench prompt suite 或 prompt 元数据。对我们自己的 ViewBench/minWM prompt 可以计算，但解释时只能作为内部参考，不能直接等同官方 leaderboard。
 
 ### 成功标准
 
@@ -882,9 +1224,47 @@ keep_ratio = clamp(base + c * fov_overlap - d * motion_score, min_keep, max_keep
 
 ### 成功标准
 
-- dynamic pruning 降低平均 retrieved token 数。
+- dynamic pruning 根据每个 stored block 的相机运动幅度改变实际 keep ratio，并降低平均 retrieved token 数。
 - 相比固定 keep ratio，不明显损害 camera-following 稳定性。
 - 在相近视觉质量下提升速度或降低显存。
+
+### 当前实现状态
+
+第一版动态剪枝已经接入 store-time KV compression 路径。实现位置：
+
+- `Wan21/pipeline/kv_bank.py`
+  - 每个 block 入 bank 前，从 `viewmats` 计算 `translation_delta` 和 `rotation_delta_rad`。
+  - 根据运动幅度计算 `motion_score`。
+  - 用动态 `keep_ratio` 压缩 normal KV 和 PRoPE KV。
+  - `[kv-bank]` 日志会打印每个 block 的 `keep_ratio` 和 `motion_score`。
+- `Wan21/wan_inference.py`
+  - 新增动态剪枝 CLI 参数。
+- `Wan21/pipeline/causal_inference.py`
+  - DMD / ODE 路径将动态剪枝参数传入 `KVBank`。
+- `Wan21/pipeline/causal_diffusion_inference.py`
+  - diffusion 路径将动态剪枝参数传入 `KVBank`。
+- `Wan21/scripts/inference/run_infer_causal_camera.sh`
+  - 新增对应环境变量，统一传给 `wan_inference.py`。
+
+当前使用的连续策略是：
+
+```text
+motion_score = translation_delta / translation_scale + rotation_delta_rad / rotation_scale
+keep_ratio = clamp(base_keep_ratio - motion_weight * motion_score, min_keep, max_keep)
+```
+
+默认参数：
+
+```text
+base_keep_ratio = 0.5
+min_keep = 0.25
+max_keep = 0.75
+translation_scale = 1.0
+rotation_scale = 0.35
+motion_weight = 0.25
+```
+
+解释：相机运动越大，当前版本会更激进地压缩历史 block；相机运动较小时使用接近固定剪枝的 keep ratio。后续如果实验证明大运动更需要保留更多 token，可以将公式改为 `base + motion_weight * motion_score` 或加入 FOV overlap 正向项。
 
 ## 评估计划
 
@@ -913,6 +1293,91 @@ E4: FOV retrieval
 E5: hybrid retrieval
 E6: pose retrieval + fixed pruning
 E7: FOV/hybrid retrieval + dynamic pruning
+```
+
+### 一键实验矩阵脚本
+
+当前已经提供 ViewBench small12 的矩阵 runner：
+
+```bash
+cd /pool/hdd/home/hhhjyz/research/minWM
+
+bash Wan21/scripts/inference/run_viewbench_worldkv_fov_experiments.sh
+```
+
+默认设置：
+
+- `MAX_PROMPTS=5`
+- `NUM_OUTPUT_FRAMES=120`
+- `SEEDS=0`
+- `KV_BANK_MAX_BLOCKS=45`
+- `RETRIEVAL_FRAMES=12`
+- `RETRIEVAL_RECENT_FRAMES=32`
+- `RETRIEVAL_FOV_SAMPLES=8192`
+
+默认会依次跑：
+
+```text
+baseline
+fixed_sink
+periodic_sink
+pose_compress_store
+worldkv_fov_compress_store
+```
+
+快速排错建议先 dry-run：
+
+```bash
+DRY_RUN=1 \
+CASES="baseline worldkv_fov_dynamic_compress_store" \
+MAX_PROMPTS=1 \
+NUM_OUTPUT_FRAMES=20 \
+bash Wan21/scripts/inference/run_viewbench_worldkv_fov_experiments.sh
+```
+
+动态剪枝单独实验：
+
+```bash
+CASES="worldkv_fov_dynamic_compress_store" \
+MAX_PROMPTS=5 \
+NUM_OUTPUT_FRAMES=120 \
+RUN_ROOT=./outputs/viewbench_worldkv_fov_dynamic_prune_120f \
+bash Wan21/scripts/inference/run_viewbench_worldkv_fov_experiments.sh
+```
+
+可调参数：
+
+```bash
+KV_COMPRESSION_DYNAMIC_MIN_KEEP=0.25
+KV_COMPRESSION_DYNAMIC_MAX_KEEP=0.75
+KV_COMPRESSION_DYNAMIC_TRANSLATION_SCALE=1.0
+KV_COMPRESSION_DYNAMIC_ROTATION_SCALE=0.35
+KV_COMPRESSION_DYNAMIC_MOTION_WEIGHT=0.25
+```
+
+正式小规模比较：
+
+```bash
+SEEDS="0 1 2" \
+MAX_PROMPTS=12 \
+NUM_OUTPUT_FRAMES=180 \
+RUN_ROOT=./outputs/viewbench_worldkv_fov_formal \
+bash Wan21/scripts/inference/run_viewbench_worldkv_fov_experiments.sh
+```
+
+每个 case 的输出目录形如：
+
+```text
+RUN_ROOT/seed_0/baseline/
+RUN_ROOT/seed_0/worldkv_fov_compress_store/profile/
+RUN_ROOT/seed_0/worldkv_fov_dynamic_compress_store/profile/
+```
+
+矩阵脚本会额外生成：
+
+```text
+RUN_ROOT/experiment_manifest.txt
+RUN_ROOT/experiment_summary.tsv
 ```
 
 ### 推荐 trajectory
@@ -960,6 +1425,187 @@ compression 会改变 token 数。所有默认假设 `chunk_size * frame_seq_len
 
 不要一开始同时加入 retrieval、compression、dynamic pruning。每次只加一个机制，避免结果无法解释。
 
+## 里程碑 8：基于 KV bank 的 sink frame 更新策略
+
+### 目标
+
+在 fixed sink 和 periodic latest sink 之外，新增一组从历史 KV bank 中选择 sink block 的策略，用来测试“把哪些历史记忆放入 sink 槽”对长视频 loop closure 和 camera memory 的影响。
+
+### 新增策略
+
+新增 `SINK_STRATEGY`：
+
+- `bank_random`：从满足条件的历史 KV bank block 中随机选择 1 个 block，随机过程由 `SINK_BANK_SEED` 固定，便于复现实验。
+- `bank_uniform`：从满足条件的历史 KV bank block 中按顺序轮转选择，尽量覆盖不同历史位置。
+- `bank_pose`：复用当前 WorldKV pose 距离，选择与当前 camera pose 最相似的历史 block。
+- `bank_worldkv_fov`：复用当前 WorldKV FOV overlap 距离，选择与当前视锥重叠最高的历史 block。`bank_fov` 在代码里作为别名映射到这一策略。
+
+这几种策略仍然使用 `SINK_SIZE` 控制 sink 槽大小，并使用 `SINK_UPDATE_INTERVAL` 控制多久更新一次。当前默认实验中 `SINK_SIZE=4`，而 minWM 每个 causal block 也是 4 latent frames，因此每次从 KV bank 中选 1 个历史 block 填入 sink 槽。
+
+### 候选 block 过滤
+
+bank sink 会过滤以下 block：
+
+- 起始帧早于固定 sink 区域的 block，避免覆盖原始 sink 语义。
+- 与当前 block 重叠或位于未来的 block。
+- 距当前 block 太近的 block；这个间隔复用 `RETRIEVAL_RECENT_FRAMES`，例如 32 latent frames。
+- 不包含当前分支的 block。DMD/ODE/CD DMD 路径使用 `main` 分支；diffusion 路径分别使用 `cond` 和 `uncond` 分支。
+
+### 实现位置
+
+- [Wan21/pipeline/sink_utils.py](/pool/hdd/home/hhhjyz/research/minWM/Wan21/pipeline/sink_utils.py)：新增策略枚举、bank block 选择、bank KV 复制到 sink 槽、压缩 token 不足时清零尾部。
+- [Wan21/pipeline/causal_inference.py](/pool/hdd/home/hhhjyz/research/minWM/Wan21/pipeline/causal_inference.py)：DMD/causal 路径在 clean context 更新后调用 `maybe_update_sink`。
+- [Wan21/pipeline/causal_diffusion_inference.py](/pool/hdd/home/hhhjyz/research/minWM/Wan21/pipeline/causal_diffusion_inference.py)：diffusion 路径分别对 `cond/uncond` cache 调用 `maybe_update_sink`。
+- [Wan21/wan_inference.py](/pool/hdd/home/hhhjyz/research/minWM/Wan21/wan_inference.py)：新增 CLI 策略和 `--sink_bank_seed`。
+- [Wan21/scripts/inference/run_infer_causal_camera.sh](/pool/hdd/home/hhhjyz/research/minWM/Wan21/scripts/inference/run_infer_causal_camera.sh)：新增 `SINK_BANK_SEED` 环境变量。
+- [Wan21/scripts/inference/run_viewbench_worldkv_fov_experiments.sh](/pool/hdd/home/hhhjyz/research/minWM/Wan21/scripts/inference/run_viewbench_worldkv_fov_experiments.sh)：新增 `bank_random_sink`、`bank_uniform_sink`、`bank_pose_sink`、`bank_worldkv_fov_sink` 可选 case。
+
+### 使用命令
+
+单独测试一种 bank sink：
+
+```bash
+cd /pool/hdd/home/hhhjyz/research/minWM
+conda activate ling
+
+RUN_ROOT=./outputs/viewbench_bank_sink_probe_120f \
+CASES="baseline fixed_sink periodic_sink bank_random_sink bank_uniform_sink bank_pose_sink bank_worldkv_fov_sink" \
+SEEDS="0" \
+MAX_PROMPTS=1 \
+NUM_OUTPUT_FRAMES=120 \
+SINK_SIZE=4 \
+SINK_UPDATE_INTERVAL=4 \
+SINK_BANK_SEED=0 \
+KV_BANK_MAX_BLOCKS=45 \
+RETRIEVAL_RECENT_FRAMES=32 \
+bash Wan21/scripts/inference/run_viewbench_worldkv_fov_experiments.sh
+```
+
+如果只想快速看策略是否能正确触发：
+
+```bash
+cd /pool/hdd/home/hhhjyz/research/minWM
+conda activate ling
+
+DRY_RUN=1 \
+CASES="bank_random_sink bank_uniform_sink bank_pose_sink bank_worldkv_fov_sink" \
+bash Wan21/scripts/inference/run_viewbench_worldkv_fov_experiments.sh
+```
+
+### 当前风险
+
+1. PRoPE KV 仍然是直接复制已编码后的历史 KV 到 sink 槽，没有重新按 sink 位置和当前 camera pose 进行严格重编码。这和之前 periodic sink 的风险一致。若 bank sink 画面出现视角错位、漂移或局部纹理突变，优先排查这里。
+2. 如果开启 store-time compression，KV bank block 的 token 数可能小于 `SINK_SIZE * frame_seq_length`。当前实现会复制可用 token，并把剩余 sink token 清零，避免旧 sink 污染。但这意味着 compressed bank sink 与 full bank sink 的注意力容量不同，正式对比时建议先关闭 compression。
+3. `bank_random` 是消融基线，不代表合理记忆策略；它主要用于判断“任意历史记忆进入 sink”是否会破坏生成。
+4. `bank_pose` 和 `bank_worldkv_fov` 复用 retrieval metric，选择结果取决于 ViewBench pose 输入是否已经正确转换为 minWM 使用的 PRoPE camera pose。
+
+## 里程碑 9：PRoPE KV 重编码策略
+
+### 目标
+
+在 retrieval 和 bank sink 两条路径中加入可选 PRoPE KV re-encoding，测试“历史 camera memory 是否应该被重编码到当前 camera pose”。
+
+### 数学假设
+
+minWM 的 PRoPE 对 K/V 使用相机投影矩阵的逆变换。简化地看：
+
+```text
+prope_kv_src = P_src_inv @ raw_kv
+```
+
+如果希望把已经存储的历史 PRoPE KV 重编码到当前 block 的相机 pose，可以近似做：
+
+```text
+raw_kv ~= P_src @ prope_kv_src
+prope_kv_current = P_current_inv @ raw_kv
+                 = P_current_inv @ P_src @ prope_kv_src
+```
+
+当前实现正是这个线性变换：`P_current_inv @ P_src`。
+
+### 新增开关
+
+新增：
+
+```text
+PROPE_REENCODE_MODE=none|current
+```
+
+- `none`：默认值，不改变已有实验行为。retrieval 和 sink 都继续使用存 bank 时已有的 PRoPE KV。
+- `current`：retrieval payload 取出时、bank sink 写入 sink 槽前，尝试把历史 PRoPE KV 从历史 pose 重编码到当前 block pose。
+
+### 实现位置
+
+- [Wan21/pipeline/kv_bank.py](/pool/hdd/home/hhhjyz/research/minWM/Wan21/pipeline/kv_bank.py)
+  - 新增 `reencode_prope_kv_to_current`。
+  - retrieval payload 中新增 `prope_reencode_mode`、`current_viewmats`、`current_Ks`。
+  - `retrieval_events` 会记录 `prope_reencode_mode` 和 `prope_reencoded`。
+- [Wan21/pipeline/sink_utils.py](/pool/hdd/home/hhhjyz/research/minWM/Wan21/pipeline/sink_utils.py)
+  - bank sink 复制 PRoPE KV 前支持重编码。
+  - `[sink-update]` 日志会打印 `prope_reencode` 和 `prope_reencoded`。
+- [Wan21/pipeline/causal_inference.py](/pool/hdd/home/hhhjyz/research/minWM/Wan21/pipeline/causal_inference.py)
+  - DMD/causal 路径将当前 `vm_chunk/ks_chunk` 传入 retrieval 和 sink reencode。
+- [Wan21/pipeline/causal_diffusion_inference.py](/pool/hdd/home/hhhjyz/research/minWM/Wan21/pipeline/causal_diffusion_inference.py)
+  - diffusion 路径对 `cond/uncond` 分支同步支持。
+- [Wan21/wan_inference.py](/pool/hdd/home/hhhjyz/research/minWM/Wan21/wan_inference.py)
+  - 新增 `--prope_reencode_mode`。
+- [Wan21/scripts/inference/run_infer_causal_camera.sh](/pool/hdd/home/hhhjyz/research/minWM/Wan21/scripts/inference/run_infer_causal_camera.sh)
+  - 新增 `PROPE_REENCODE_MODE`。
+- [Wan21/scripts/inference/run_viewbench_worldkv_fov_experiments.sh](/pool/hdd/home/hhhjyz/research/minWM/Wan21/scripts/inference/run_viewbench_worldkv_fov_experiments.sh)
+  - 矩阵实验会把 `PROPE_REENCODE_MODE` 写入 manifest 和 run meta。
+
+### 使用命令
+
+测试 retrieval PRoPE reencode：
+
+```bash
+cd /pool/hdd/home/hhhjyz/research/minWM
+conda activate ling
+
+RUN_ROOT=./outputs/viewbench_prope_reencode_retrieval_120f \
+CASES="worldkv_fov" \
+SEEDS="0" \
+MAX_PROMPTS=1 \
+NUM_OUTPUT_FRAMES=120 \
+PROPE_REENCODE_MODE=current \
+bash Wan21/scripts/inference/run_viewbench_worldkv_fov_experiments.sh
+```
+
+测试 bank sink PRoPE reencode：
+
+```bash
+cd /pool/hdd/home/hhhjyz/research/minWM
+conda activate ling
+
+RUN_ROOT=./outputs/viewbench_prope_reencode_sink_120f \
+CASES="bank_pose_sink bank_worldkv_fov_sink" \
+SEEDS="0" \
+MAX_PROMPTS=1 \
+NUM_OUTPUT_FRAMES=120 \
+SINK_SIZE=4 \
+SINK_UPDATE_INTERVAL=4 \
+PROPE_REENCODE_MODE=current \
+bash Wan21/scripts/inference/run_viewbench_worldkv_fov_experiments.sh
+```
+
+建议正式对比时至少包含：
+
+```text
+worldkv_fov_compress_store + PROPE_REENCODE_MODE=none
+worldkv_fov + PROPE_REENCODE_MODE=none
+worldkv_fov + PROPE_REENCODE_MODE=current
+bank_worldkv_fov_sink + PROPE_REENCODE_MODE=none
+bank_worldkv_fov_sink + PROPE_REENCODE_MODE=current
+```
+
+### 当前限制和风险
+
+1. 第一版只支持 `current` 目标 pose，不支持把历史 block 重编码到“虚拟历史时间轴 pose”。
+2. 若 bank block 已经 store-time compression，当前实现会跳过 PRoPE reencode。原因是压缩后 token 与 frame 的规则排列可能被破坏，无法可靠 reshape 为 `(cameras, patches)`。
+3. 如果 source block 和 current block 的 camera 数不同，也会跳过 reencode。
+4. 这个策略不一定天然更好。PRoPE 的标准 cross-attention 解释通常是 query 使用当前 pose，key/value 使用自身 source pose；强行重编码到当前 pose 是一个实验假设，需要用 ViewBench loop closure 和 VBench-style 指标判断。
+5. `prope_reencoded=0` 不一定是 bug，可能表示当前 block 缺 pose、source/destination camera 数不匹配，或 selected block 是 compressed block。
+
 ## 近期建议步骤
 
 1. 跑通 minWM Wan21 Action2V quickstart。
@@ -970,6 +1616,19 @@ compression 会改变 token 数。所有默认假设 `chunk_size * frame_seq_len
 
 ## 维护日志
 
+- 2026-07-18
+  - 完成里程碑 8 第一版：新增基于 KV bank 的 sink frame 更新策略。
+  - 支持 `bank_random`、`bank_uniform`、`bank_pose`、`bank_worldkv_fov`，并新增 `SINK_BANK_SEED` 控制随机消融可复现。
+  - bank sink 会复用 KV bank 中的 normal KV / PRoPE KV，并在 compressed block token 不足时清零 sink 尾部，避免旧内容残留。
+  - 已在文档中标注 PRoPE 直接复制不重编码的几何一致性风险。
+  - 完成里程碑 9 第一版：新增 `PROPE_REENCODE_MODE=none|current`，在 retrieval 和 bank sink 路径中支持 PRoPE KV 重编码实验。
+
+- 2026-07-17
+  - 完成里程碑 7 第一版：在 store-time KV compression 中加入基于相机运动幅度的动态 keep ratio。
+  - 动态剪枝公式：`keep_ratio = clamp(base - motion_weight * motion_score, min_keep, max_keep)`，其中 `motion_score` 由 block 内平移幅度与旋转角归一化得到。
+  - 新增 `worldkv_fov_dynamic_compress_store` 实验 case；默认五组正式实验保持不变，需要动态剪枝时通过 `CASES` 显式指定。
+  - 已完成 bash 语法检查、Python py_compile、动态 case dry-run 和 fake-cache 动态 keep ratio 验证。
+
 - 2026-07-16
   - 完成里程碑 4 第一版：在 minWM causal attention 中加入 WorldKV 风格 `[sink | retrieved | recent]` retrieval window。
   - 完成里程碑 5 第一版：新增 `pose`、`worldkv_fov`、`hy_fov`、`hybrid`、`recent_only` 检索 metric。
@@ -977,6 +1636,7 @@ compression 会改变 token 数。所有默认假设 `chunk_size * frame_seq_len
   - 新增 `retrieval_rope_correction` / `RETRIEVAL_ROPE_CORRECTION`，支持 WorldKV-style normal KV time-axis RoPE rebasing。
   - 新增 `Wan21/pipeline/retrieval_utils.py`，集中实现 WorldKV 和 HY-WorldPlay 风格的检索距离。
   - 新增 `retrieval_events.csv/jsonl`，记录 block-level candidate/selected block、distance、retrieved token 数和检索耗时。
+  - 新增 `run_viewbench_worldkv_fov_experiments.sh`，一键跑 baseline、sink、retrieval、FOV 和 compression 实验矩阵。
   - 已用 `ling` 环境完成 py_compile、bash 语法检查和 fake-cache 单元验证。
   - 完成里程碑 3：新增 chunk-level KV bank。
   - DMD/ODE 保存 main 分支，diffusion 保存 cond/uncond 分支。
@@ -989,3 +1649,9 @@ compression 会改变 token 数。所有默认假设 `chunk_size * frame_seq_len
   - 确认 minWM causal attention 具备 KV cache、PRoPE KV cache、`local_attn_size` 和潜在的 `sink_size` 机制。
   - 将文档改写为中文版本，方便后续持续维护。
   - 完成里程碑 1：加入可开关的 cache-state 日志，覆盖 causal DMD 与 causal diffusion 推理路径。
+# 历史实验计划
+
+> 本文档保留早期 ViewBench 实验记录，仅用于结果追溯。当前推理入口已经统一为
+> prompt + minWM action string；请以
+> [`Wan21/README_STRING_CAMERA_EXPERIMENTS.md`](Wan21/README_STRING_CAMERA_EXPERIMENTS.md)
+> 为准。文中 ViewBench pose、manifest 和 runner 路径已不再存在。

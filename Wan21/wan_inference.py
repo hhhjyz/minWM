@@ -1,5 +1,6 @@
 import argparse
 import csv
+import hashlib
 import torch
 import os
 import time
@@ -16,10 +17,62 @@ import json
 
 from wan_utils.dataset import TextDataset, TextImagePairDataset
 from wan_utils.misc import set_seed
-from wan_utils.camera_trajectory import parse_trajectory
-from wan_utils.viewbench_pose import load_pose_npz
+from wan_utils.camera_trajectory import make_camera_tensors
 
 from demo_utils.memory import gpu, get_cuda_free_memory_gb, DynamicSwapInstaller
+
+
+def safe_video_filename(prompt: str, camera_suffix: str, *, max_length: int = 180) -> str:
+    raw = f"{prompt[:100]}{camera_suffix}"
+    safe = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in raw)
+    safe = "_".join(part for part in safe.split("_") if part)
+    if not safe:
+        safe = "video"
+    digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:10]
+    suffix = f"_{digest}"
+    if len(safe) + len(suffix) > max_length:
+        safe = safe[: max(1, max_length - len(suffix))].rstrip("._-")
+    return f"{safe}{suffix}.mp4"
+
+
+def summarize_camera_pose(viewmats):
+    if viewmats is None:
+        return {
+            "camera_pose_frames": 0,
+            "camera_translation_range": "",
+            "camera_translation_final": "",
+            "camera_rotation_range_deg": "",
+            "camera_rotation_final_deg": "",
+            "camera_first_motion_frame": "",
+        }
+
+    with torch.no_grad():
+        c2w = torch.linalg.inv(viewmats.detach().float().cpu()[0])
+        positions = c2w[:, :3, 3]
+        rotations = c2w[:, :3, :3]
+        rel = rotations[0].transpose(-1, -2).unsqueeze(0) @ rotations
+        trace = rel.diagonal(dim1=-2, dim2=-1).sum(dim=-1)
+        angles = torch.rad2deg(torch.acos(((trace - 1.0) * 0.5).clamp(-1.0, 1.0)))
+        trans_from_first = torch.linalg.norm(positions - positions[:1], dim=-1)
+        if len(c2w) > 1:
+            step_trans = torch.linalg.norm(positions[1:] - positions[:-1], dim=-1)
+            step_rel = rotations[:-1].transpose(-1, -2) @ rotations[1:]
+            step_trace = step_rel.diagonal(dim1=-2, dim2=-1).sum(dim=-1)
+            step_angles = torch.rad2deg(torch.acos(((step_trace - 1.0) * 0.5).clamp(-1.0, 1.0)))
+            motion = step_trans + step_angles / 30.0
+            moving = torch.nonzero(motion > 1e-3, as_tuple=False)
+            first_motion_frame = int(moving[0].item() + 1) if moving.numel() else ""
+        else:
+            first_motion_frame = ""
+
+    return {
+        "camera_pose_frames": int(len(c2w)),
+        "camera_translation_range": float(trans_from_first.max().item()),
+        "camera_translation_final": float(trans_from_first[-1].item()),
+        "camera_rotation_range_deg": float(angles.max().item()),
+        "camera_rotation_final_deg": float(angles[-1].item()),
+        "camera_first_motion_frame": first_motion_frame,
+    }
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--config_path", type=str, help="Path to the config file")
@@ -35,12 +88,12 @@ parser.add_argument("--i2v", action="store_true", help="Whether to perform I2V (
 parser.add_argument("--sp_size", type=int, default=1, help="Sequence parallel size (1=disabled)")
 parser.add_argument("--trajectory", type=str, default=None, help="Camera trajectory string (e.g., 'w*19' for camera control)")
 parser.add_argument("--trajectory_path", type=str, default=None, help="Path to trajectory file (one trajectory string per line, aligned with data_path)")
-parser.add_argument("--trajectory_pose_path", type=str, default=None, help="Path to pose-npz list file (one .npz per line, aligned with data_path)")
 parser.add_argument("--log_cache_state", action="store_true", help="Log per-block KV/PRoPE cache state and CUDA memory.")
 parser.add_argument("--log_cache_interval", type=int, default=1, help="Log every N generated blocks when --log_cache_state is enabled.")
-parser.add_argument("--sink_strategy", type=str, default="none", choices=["none", "fixed", "periodic"], help="Sink-frame KV cache strategy.")
+parser.add_argument("--sink_strategy", type=str, default="none", choices=["none", "fixed", "periodic", "bank_random", "bank_uniform", "bank_pose", "bank_worldkv_fov", "bank_fov"], help="Sink-frame KV cache strategy.")
 parser.add_argument("--sink_size", type=int, default=0, help="Number of latent frames reserved as sink frames.")
-parser.add_argument("--sink_update_interval", type=int, default=0, help="For periodic sink, update sink every N generated blocks.")
+parser.add_argument("--sink_update_interval", type=int, default=0, help="For periodic/bank sink, update sink every N generated blocks.")
+parser.add_argument("--sink_bank_seed", type=int, default=0, help="Deterministic seed for bank_random sink selection.")
 parser.add_argument("--kv_bank_enable", action="store_true", help="Store clean per-block KV in a sidecar bank without retrieval.")
 parser.add_argument("--kv_bank_device", choices=["cpu", "cuda"], default="cpu", help="Storage device for KV bank tensors.")
 parser.add_argument("--kv_bank_max_blocks", type=int, default=0, help="Maximum retained bank blocks. 0 means unlimited; positive values evict oldest blocks.")
@@ -56,11 +109,18 @@ parser.add_argument("--retrieval_fov_h_deg", type=float, default=60.0, help="Hor
 parser.add_argument("--retrieval_fov_v_deg", type=float, default=35.0, help="Vertical FOV in degrees for retrieval scoring.")
 parser.add_argument("--retrieval_hybrid_fov_weight", type=float, default=0.5, help="FOV distance weight for hybrid retrieval.")
 parser.add_argument("--retrieval_rope_correction", action="store_true", help="WorldKV-style time-axis RoPE rebasing for retrieved normal KV.")
+parser.add_argument("--prope_reencode_mode", choices=["none", "current"], default="none", help="Experimental PRoPE KV re-encoding for retrieved/bank-sink memory.")
 parser.add_argument("--kv_compression_enable", action="store_true", help="Enable WorldKV-style anchor + novelty KV compression.")
 parser.add_argument("--kv_compression_keep_ratio", type=float, default=0.5, help="Token keep ratio for non-anchor frames.")
 parser.add_argument("--kv_compression_anchor_rotate", action="store_true", help="Rotate the anchor frame during runtime retrieval compression.")
 parser.add_argument("--kv_compression_at_store", action="store_true", help="Compress each block once when storing into KV bank.")
 parser.add_argument("--kv_compression_pooled", action="store_true", help="Pool the keep budget across non-anchor frames during KV compression.")
+parser.add_argument("--kv_compression_dynamic_enable", action="store_true", help="Adjust store-time KV compression keep ratio from camera motion amplitude.")
+parser.add_argument("--kv_compression_dynamic_min_keep", type=float, default=0.25, help="Minimum dynamic KV compression keep ratio.")
+parser.add_argument("--kv_compression_dynamic_max_keep", type=float, default=0.75, help="Maximum dynamic KV compression keep ratio.")
+parser.add_argument("--kv_compression_dynamic_translation_scale", type=float, default=1.0, help="Translation delta that maps to one dynamic compression motion unit.")
+parser.add_argument("--kv_compression_dynamic_rotation_scale", type=float, default=0.35, help="Rotation delta in radians that maps to one dynamic compression motion unit.")
+parser.add_argument("--kv_compression_dynamic_motion_weight", type=float, default=0.25, help="Keep-ratio reduction per dynamic compression motion unit.")
 args = parser.parse_args()
 
 # Initialize distributed inference
@@ -113,9 +173,9 @@ config = OmegaConf.merge(default_config, config)
 config.log_cache_state = args.log_cache_state
 config.log_cache_interval = max(1, args.log_cache_interval)
 if args.sink_strategy != "none":
-    assert args.sink_size > 0, "--sink_size must be > 0 when sink_strategy is fixed or periodic"
-if args.sink_strategy == "periodic":
-    assert args.sink_update_interval > 0, "--sink_update_interval must be > 0 for periodic sink"
+    assert args.sink_size > 0, "--sink_size must be > 0 when sink_strategy is enabled"
+if args.sink_strategy in {"periodic", "bank_random", "bank_uniform", "bank_pose", "bank_worldkv_fov", "bank_fov"}:
+    assert args.sink_update_interval > 0, "--sink_update_interval must be > 0 for updating sink strategies"
 model_kwargs = config.get("model_kwargs", {})
 local_attn_size = int(model_kwargs.get("local_attn_size", -1))
 if args.sink_size > 0 and local_attn_size != -1:
@@ -126,6 +186,7 @@ effective_sink_size = int(args.sink_size) if args.sink_strategy != "none" else 0
 config.model_kwargs.sink_size = effective_sink_size
 config.sink_strategy = args.sink_strategy
 config.sink_update_interval = int(args.sink_update_interval)
+config.sink_bank_seed = int(args.sink_bank_seed)
 config.kv_bank_enable = bool(args.kv_bank_enable)
 config.kv_bank_device = args.kv_bank_device
 config.kv_bank_max_blocks = max(0, int(args.kv_bank_max_blocks))
@@ -141,11 +202,18 @@ config.retrieval_fov_h_deg = float(args.retrieval_fov_h_deg)
 config.retrieval_fov_v_deg = float(args.retrieval_fov_v_deg)
 config.retrieval_hybrid_fov_weight = float(args.retrieval_hybrid_fov_weight)
 config.retrieval_rope_correction = bool(args.retrieval_rope_correction)
+config.prope_reencode_mode = args.prope_reencode_mode
 config.kv_compression_enable = bool(args.kv_compression_enable)
 config.kv_compression_keep_ratio = float(args.kv_compression_keep_ratio)
 config.kv_compression_anchor_rotate = bool(args.kv_compression_anchor_rotate)
 config.kv_compression_at_store = bool(args.kv_compression_at_store)
 config.kv_compression_pooled = bool(args.kv_compression_pooled)
+config.kv_compression_dynamic_enable = bool(args.kv_compression_dynamic_enable)
+config.kv_compression_dynamic_min_keep = float(args.kv_compression_dynamic_min_keep)
+config.kv_compression_dynamic_max_keep = float(args.kv_compression_dynamic_max_keep)
+config.kv_compression_dynamic_translation_scale = float(args.kv_compression_dynamic_translation_scale)
+config.kv_compression_dynamic_rotation_scale = float(args.kv_compression_dynamic_rotation_scale)
+config.kv_compression_dynamic_motion_weight = float(args.kv_compression_dynamic_motion_weight)
 
 # Import pipeline AFTER distributed init so causal_model.py sees CleanCode SP infra
 from pipeline import (
@@ -263,8 +331,13 @@ if local_rank == 0:
                 "status",
                 "prompt",
                 "trajectory",
-                "trajectory_pose_path",
                 "num_output_frames",
+                "camera_pose_frames",
+                "camera_translation_range",
+                "camera_translation_final",
+                "camera_rotation_range_deg",
+                "camera_rotation_final_deg",
+                "camera_first_motion_frame",
                 "num_generated_latent_frames",
                 "generation_seconds",
                 "postprocess_seconds",
@@ -294,6 +367,8 @@ if local_rank == 0:
         "metric",
         "retrieval_frames",
         "rope_correction",
+        "prope_reencode_mode",
+        "prope_reencoded",
         "candidate_block_ids",
         "selected_block_ids",
         "selected_frame_starts",
@@ -316,76 +391,40 @@ if args.trajectory_path:
         f"{selected_indices[-1]} requires at least {selected_indices[-1] + 1} lines"
     )
 
-trajectory_pose_list = None
-if args.trajectory_pose_path:
-    with open(args.trajectory_pose_path, encoding="utf-8") as _f:
-        trajectory_pose_list = [line.strip() for line in _f if line.strip()]
-    assert len(trajectory_pose_list) > selected_indices[-1], (
-        f"trajectory_pose_path has {len(trajectory_pose_list)} lines but selected prompt index "
-        f"{selected_indices[-1]} requires at least {selected_indices[-1] + 1} lines"
-    )
-    if trajectory_list or args.trajectory:
-        print("[camera] --trajectory_pose_path is set; it takes precedence over trajectory strings.")
-
-
 def resolve_camera(idx: int, requested_num_frames: int):
     sample_num_frames = requested_num_frames
     viewmats = None
     Ks = None
     traj_str = None
-    traj_pose_path = None
 
-    if trajectory_pose_list:
-        traj_pose_path = trajectory_pose_list[idx]
-        viewmats, Ks, sample_num_frames = load_pose_npz(
-            traj_pose_path,
-            num_frames=requested_num_frames if requested_num_frames > 0 else None,
+    if trajectory_list:
+        traj_str = trajectory_list[idx]
+    elif args.trajectory:
+        traj_str = args.trajectory
+    if traj_str:
+        viewmats, Ks = make_camera_tensors(
+            traj_str,
             device=device,
             dtype=torch.bfloat16,
         )
-    else:
-        if trajectory_list:
-            traj_str = trajectory_list[idx]
-        elif args.trajectory:
-            traj_str = args.trajectory
-        if traj_str:
-            import numpy as np
-            viewmats_np = parse_trajectory(traj_str)
-            if requested_num_frames > 0:
-                if len(viewmats_np) < requested_num_frames:
-                    raise ValueError(
-                        f"trajectory has {len(viewmats_np)} frames, but "
-                        f"num_output_frames={requested_num_frames}"
-                    )
-                viewmats_np = viewmats_np[:requested_num_frames]
-            sample_num_frames = len(viewmats_np)
-            # Default intrinsics (normalized)
-            fx, fy, cx, cy = 0.5, 0.5, 0.5, 0.5
-            Ks_np = np.array(
-                [[[fx, 0, cx], [0, fy, cy], [0, 0, 1]]] * len(viewmats_np),
-                dtype=np.float32,
-            )
-            viewmats = torch.from_numpy(viewmats_np).unsqueeze(0).to(device=device, dtype=torch.bfloat16)
-            Ks = torch.from_numpy(Ks_np).unsqueeze(0).to(device=device, dtype=torch.bfloat16)
+        if requested_num_frames > 0:
+            if viewmats.shape[1] < requested_num_frames:
+                raise ValueError(
+                    f"trajectory has {viewmats.shape[1]} frames, but "
+                    f"num_output_frames={requested_num_frames}"
+                )
+            viewmats = viewmats[:, :requested_num_frames]
+            Ks = Ks[:, :requested_num_frames]
+        sample_num_frames = int(viewmats.shape[1])
 
     block_size = int(config.get("num_frame_per_block", 1))
     if block_size > 1 and sample_num_frames % block_size != 0:
-        trimmed = sample_num_frames - (sample_num_frames % block_size)
-        if trajectory_pose_list and requested_num_frames <= 0 and trimmed > 0:
-            print(
-                f"[camera] trimming pose length from {sample_num_frames} to {trimmed} "
-                f"to match num_frame_per_block={block_size}"
-            )
-            viewmats = viewmats[:, :trimmed] if viewmats is not None else None
-            Ks = Ks[:, :trimmed] if Ks is not None else None
-            sample_num_frames = trimmed
-        else:
-            raise ValueError(
-                f"num_output_frames={sample_num_frames} must be divisible by "
-                f"num_frame_per_block={block_size}"
-            )
+        raise ValueError(
+            f"num_output_frames={sample_num_frames} must be divisible by "
+            f"num_frame_per_block={block_size}"
+        )
 
-    return viewmats, Ks, traj_str, traj_pose_path, sample_num_frames
+    return viewmats, Ks, traj_str, sample_num_frames
 
 def encode(self, videos: torch.Tensor) -> torch.Tensor:
     device, dtype = videos[0].device, videos[0].dtype
@@ -418,20 +457,28 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
     all_video = []
     num_generated_frames = 0  # Number of generated (latent) frames
     prompt = batch['prompts'][0]
-    viewmats, Ks, traj_str, traj_pose_path, sample_num_output_frames = resolve_camera(
+    viewmats, Ks, traj_str, sample_num_output_frames = resolve_camera(
         idx, args.num_output_frames
     )
-    if sample_num_output_frames <= 0:
-        raise ValueError(
-            "--num_output_frames must be > 0 unless --trajectory_pose_path provides "
-            "a pose sequence length"
+    pose_summary = summarize_camera_pose(viewmats)
+    if local_rank == 0:
+        print(
+            f"[camera-pose] sample={i} prompt_index={idx} "
+            f"trajectory={traj_str or ''} "
+            f"frames={pose_summary['camera_pose_frames']} "
+            f"trans_range={pose_summary['camera_translation_range']} "
+            f"trans_final={pose_summary['camera_translation_final']} "
+            f"rot_range_deg={pose_summary['camera_rotation_range_deg']} "
+            f"rot_final_deg={pose_summary['camera_rotation_final_deg']} "
+            f"first_motion_frame={pose_summary['camera_first_motion_frame']}",
+            flush=True,
         )
+    if sample_num_output_frames <= 0:
+        raise ValueError("--num_output_frames must be > 0")
     camera_suffix = ""
-    if traj_pose_path:
-        camera_suffix = "_" + Path(traj_pose_path).stem[:80]
-    elif traj_str:
+    if traj_str:
         camera_suffix = "_" + traj_str.replace("*", "").replace(",", "")
-    output_path = os.path.join(args.output_folder, f'{prompt[:100]}{camera_suffix}.mp4')
+    output_path = os.path.join(args.output_folder, safe_video_filename(prompt, camera_suffix))
 
     if args.i2v:
         assert config.num_frame_per_block == 1, "Current I2V only supports the frame-wise model."
@@ -445,8 +492,8 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
                     "status": "skipped_exists",
                     "prompt": prompt,
                     "trajectory": traj_str or "",
-                    "trajectory_pose_path": traj_pose_path or "",
                     "num_output_frames": sample_num_output_frames,
+                    **pose_summary,
                     "num_generated_latent_frames": 0,
                     "generation_seconds": 0.0,
                     "postprocess_seconds": 0.0,
@@ -489,8 +536,8 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
                     "status": "skipped_exists",
                     "prompt": prompt,
                     "trajectory": traj_str or "",
-                    "trajectory_pose_path": traj_pose_path or "",
                     "num_output_frames": sample_num_output_frames,
+                    **pose_summary,
                     "num_generated_latent_frames": 0,
                     "generation_seconds": 0.0,
                     "postprocess_seconds": 0.0,
@@ -572,6 +619,7 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
     write_video_seconds = 0.0
     if not (args.sp_size > 1 and local_rank != 0):
         write_t0 = time.perf_counter()
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
         write_video(output_path, video[0], fps=16)
         write_video_seconds = time.perf_counter() - write_t0
     if dist.is_initialized():
@@ -585,8 +633,8 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
             "status": "generated",
             "prompt": prompt,
             "trajectory": traj_str or "",
-            "trajectory_pose_path": traj_pose_path or "",
             "num_output_frames": sample_num_output_frames,
+            **pose_summary,
             "num_generated_latent_frames": num_generated_frames,
             "generation_seconds": generation_seconds,
             "postprocess_seconds": postprocess_seconds,
@@ -621,6 +669,8 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
                     "metric",
                     "retrieval_frames",
                     "rope_correction",
+                    "prope_reencode_mode",
+                    "prope_reencoded",
                     "candidate_block_ids",
                     "selected_block_ids",
                     "selected_frame_starts",
