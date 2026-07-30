@@ -20,6 +20,10 @@ LOG_CACHE_STATE="${LOG_CACHE_STATE:-0}"
 LOG_CACHE_INTERVAL="${LOG_CACHE_INTERVAL:-1}"
 SINK_STRATEGY="${SINK_STRATEGY:-none}"
 SINK_SIZE="${SINK_SIZE:-0}"
+FIXED_SINK_ROPE_REBASE="${FIXED_SINK_ROPE_REBASE:-0}"
+TRI_REGION_ROPE_REBASE="${TRI_REGION_ROPE_REBASE:-$FIXED_SINK_ROPE_REBASE}"
+ROPE_TRAIN_LENGTH="${ROPE_TRAIN_LENGTH:-21}"
+ROPE_LOCAL_WINDOW="${ROPE_LOCAL_WINDOW:-9}"
 SINK_UPDATE_INTERVAL="${SINK_UPDATE_INTERVAL:-0}"
 SINK_BANK_SEED="${SINK_BANK_SEED:-0}"
 PROPE_REENCODE_MODE="${PROPE_REENCODE_MODE:-none}"
@@ -40,6 +44,11 @@ if [ "$LOG_CACHE_STATE" = "1" ] || [ "$LOG_CACHE_STATE" = "true" ] || [ "$LOG_CA
   LOG_ARGS="--log_cache_state --log_cache_interval $LOG_CACHE_INTERVAL"
 fi
 
+SINK_REBASE_ARGS="--rope_train_length $ROPE_TRAIN_LENGTH --rope_local_window $ROPE_LOCAL_WINDOW"
+if [ "$TRI_REGION_ROPE_REBASE" = "1" ] || [ "$TRI_REGION_ROPE_REBASE" = "true" ] || [ "$TRI_REGION_ROPE_REBASE" = "True" ]; then
+  SINK_REBASE_ARGS="--tri_region_rope_rebase $SINK_REBASE_ARGS"
+fi
+
 NUM_GPUS_PER_NODE=1
 NNODES=${WORLD_SIZE:-1}
 NODE_RANK=${RANK:-0}
@@ -53,6 +62,7 @@ echo "  Output:     $OUTPUT_FOLDER"
 echo "  Subset:     start=$PROMPT_START max=$MAX_PROMPTS frames=$NUM_OUTPUT_FRAMES seed=$SEED"
 echo "  Trajectory: ${TRAJECTORY_PATH:-$TRAJECTORY}"
 echo "  Sink:       strategy=$SINK_STRATEGY size=$SINK_SIZE update_interval=$SINK_UPDATE_INTERVAL bank_seed=$SINK_BANK_SEED"
+echo "  Tri RoPE:   enabled=$TRI_REGION_ROPE_REBASE train_length=$ROPE_TRAIN_LENGTH local_window=$ROPE_LOCAL_WINDOW"
 echo "  PRoPE:      reencode_mode=$PROPE_REENCODE_MODE"
 
 export SP_SIZE=$SP_SIZE
@@ -75,6 +85,7 @@ torchrun \
   --sink_size "$SINK_SIZE" \
   --sink_update_interval "$SINK_UPDATE_INTERVAL" \
   --sink_bank_seed "$SINK_BANK_SEED" \
+  $SINK_REBASE_ARGS \
   --sp_size $SP_SIZE \
   --prope_reencode_mode "$PROPE_REENCODE_MODE" \
   $LOG_ARGS \

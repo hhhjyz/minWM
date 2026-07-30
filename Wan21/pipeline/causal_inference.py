@@ -8,7 +8,7 @@ from wan_utils.wan_wrapper import WanDiffusionWrapper, WanTextEncoder, WanVAEWra
 from demo_utils.memory import gpu, get_cuda_free_memory_gb, DynamicSwapInstaller, move_model_to_device_with_memory_preservation
 import tqdm
 from .debug_utils import log_cache_state, should_log_cache
-from .kv_bank import KVBank
+from .kv_bank import KVBank, normalize_retrieval_granularity
 from .sink_utils import get_model_sink_size_frames, is_bank_sink_strategy, maybe_update_sink, normalize_sink_strategy
 
 class CausalInferencePipeline(torch.nn.Module):
@@ -51,6 +51,9 @@ class CausalInferencePipeline(torch.nn.Module):
         self.sink_bank_seed = int(getattr(args, "sink_bank_seed", 0))
         self.sink_size_frames = get_model_sink_size_frames(self.generator)
         self.retrieval_enable = bool(getattr(args, "retrieval_enable", False))
+        self.retrieval_granularity = normalize_retrieval_granularity(
+            getattr(args, "retrieval_granularity", "chunk")
+        )
         self.retrieval_metric = str(getattr(args, "retrieval_metric", "pose"))
         self.retrieval_frames = max(0, int(getattr(args, "retrieval_frames", 0)))
         self.retrieval_recent_frames = max(0, int(getattr(args, "retrieval_recent_frames", 0)))
@@ -67,6 +70,11 @@ class CausalInferencePipeline(torch.nn.Module):
         self.kv_compression_anchor_rotate = bool(getattr(args, "kv_compression_anchor_rotate", False))
         self.kv_compression_pooled = bool(getattr(args, "kv_compression_pooled", False))
         self.kv_compression_dynamic_enable = bool(getattr(args, "kv_compression_dynamic_enable", False))
+        if self.retrieval_granularity == "latent_frame" and self.kv_compression_at_store:
+            raise ValueError(
+                "latent_frame retrieval requires uncompressed bank entries; "
+                "disable kv_compression_at_store"
+            )
         self.kv_bank = KVBank(
             enabled=bool(getattr(args, "kv_bank_enable", False)) or self.retrieval_enable or is_bank_sink_strategy(self.sink_strategy),
             device=str(getattr(args, "kv_bank_device", "cpu")),
@@ -97,6 +105,7 @@ class CausalInferencePipeline(torch.nn.Module):
         if self.retrieval_enable:
             print(
                 f"Retrieval window enabled: metric={self.retrieval_metric} "
+                f"granularity={self.retrieval_granularity} "
                 f"retrieval_frames={self.retrieval_frames} recent_exclusion={self.retrieval_recent_frames}"
             )
 
@@ -129,10 +138,14 @@ class CausalInferencePipeline(torch.nn.Module):
         if not self.retrieval_enable or self.retrieval_frames <= 0:
             return None
         retrieval_t0 = time.perf_counter()
-        selected, details = self.kv_bank.select_retrieval_blocks(
+        selector = (
+            self.kv_bank.select_retrieval_frames
+            if self.retrieval_granularity == "latent_frame"
+            else self.kv_bank.select_retrieval_blocks
+        )
+        selection_kwargs = dict(
             current_viewmats=viewmats,
             current_frame_start=current_start_frame,
-            current_frame_count=current_num_frames,
             retrieval_frames=self.retrieval_frames,
             metric=self.retrieval_metric,
             fov_samples=self.retrieval_fov_samples,
@@ -142,9 +155,12 @@ class CausalInferencePipeline(torch.nn.Module):
             hybrid_fov_weight=self.retrieval_hybrid_fov_weight,
             recent_frames=self.retrieval_recent_frames,
             sink_size_frames=self.sink_size_frames,
-            device=device,
             return_details=True,
         )
+        if self.retrieval_granularity == "chunk":
+            selection_kwargs["current_frame_count"] = current_num_frames
+            selection_kwargs["device"] = device
+        selected, details = selector(**selection_kwargs)
         selection_seconds = time.perf_counter() - retrieval_t0
         if not selected:
             self._record_retrieval_event({
@@ -152,6 +168,7 @@ class CausalInferencePipeline(torch.nn.Module):
                 "current_frame_start": current_start_frame,
                 "current_num_frames": current_num_frames,
                 "metric": self.retrieval_metric,
+                "granularity": self.retrieval_granularity,
                 "retrieval_frames": self.retrieval_frames,
                 "rope_correction": self.retrieval_rope_correction,
                 "prope_reencode_mode": self.prope_reencode_mode,
@@ -166,21 +183,24 @@ class CausalInferencePipeline(torch.nn.Module):
             })
             return None
         payload_t0 = time.perf_counter()
-        payloads = self.kv_bank.get_retrieval_payloads(
-            selected,
-            branch=branch,
-            device=device,
-            include_prope=viewmats is not None,
-            compress_runtime=self.kv_compression_enable and not self.kv_compression_at_store,
-            compression_keep_ratio=self.kv_compression_keep_ratio,
-            compression_anchor_rotate=self.kv_compression_anchor_rotate,
-            compression_pooled=self.kv_compression_pooled,
+        payload_kwargs = dict(
+            branch=branch, device=device, include_prope=viewmats is not None,
             frame_seq_length=self.frame_seq_length,
             rope_correction=self.retrieval_rope_correction,
             prope_reencode_mode=self.prope_reencode_mode,
-            current_viewmats=viewmats,
-            current_Ks=Ks,
+            current_viewmats=viewmats, current_Ks=Ks,
         )
+        if self.retrieval_granularity == "latent_frame":
+            payloads = self.kv_bank.get_frame_retrieval_payloads(selected, **payload_kwargs)
+        else:
+            payloads = self.kv_bank.get_retrieval_payloads(
+                selected,
+                compress_runtime=self.kv_compression_enable and not self.kv_compression_at_store,
+                compression_keep_ratio=self.kv_compression_keep_ratio,
+                compression_anchor_rotate=self.kv_compression_anchor_rotate,
+                compression_pooled=self.kv_compression_pooled,
+                **payload_kwargs,
+            )
         payload_seconds = time.perf_counter() - payload_t0
         retrieved_tokens = int(payloads[0]["k"].shape[1]) if payloads else 0
         self._record_retrieval_event({
@@ -188,6 +208,7 @@ class CausalInferencePipeline(torch.nn.Module):
             "current_frame_start": current_start_frame,
             "current_num_frames": current_num_frames,
             "metric": self.retrieval_metric,
+            "granularity": self.retrieval_granularity,
             "retrieval_frames": self.retrieval_frames,
             "rope_correction": self.retrieval_rope_correction,
             "prope_reencode_mode": self.prope_reencode_mode,

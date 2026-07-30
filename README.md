@@ -165,7 +165,7 @@ hf download Wan-AI/Wan2.1-T2V-1.3B --local-dir ./ckpts/Wan2.1-T2V-1.3B
 
 # Code hardcodes the load path; create a symlink.
 mkdir -p Wan21/wan_models
-ln -s "$(realpath ./ckpts/Wan2.1-T2V-1.3B)" Wan21/wan_models/Wan2.1-T2V-1.3B
+ln -s "$(realpath ../ckpts/Wan2.1-T2V-1.3B)" Wan21/wan_models/Wan2.1-T2V-1.3B
 
 
 # HY base + text/vision encoders (required by HY pipelines)
@@ -269,3 +269,25 @@ For questions, suggestions, or collaboration, please open a GitHub issue or cont
 ## 🙏 Acknowledgements
 
 minWM stands on the shoulders of giants. We thank the authors and maintainers of [HunyuanVideo 1.5](https://github.com/Tencent-Hunyuan/HunyuanVideo-1.5), [HY-WorldPlay](https://github.com/Tencent-Hunyuan/HY-WorldPlay), [Wan 2.1](https://github.com/Wan-AI/Wan), [Causal-Forcing](https://github.com/thu-ml/Causal-Forcing), and [FastVideo](https://github.com/hao-ai-lab/FastVideo) for their open-source contributions, which made this framework possible.
+
+tmux new-session -s minwm_loop_watchdog_10_15_20 \
+    "cd '$PWD' && env \
+CUDA_DEVICES='4,5' \
+DURATIONS='10s 15s 20s' \
+PYTHON_BIN="$CONDA_PREFIX/bin/python" \
+GPU_MIN_MEMORY_GB=40 \
+GPU_MIN_FREE_MEMORY_GB=40 \
+POLL_SECONDS=60 \
+RETRY_SECONDS=300 \
+bash Wan21/scripts/inference/run_string_loop_all_durations_watchdog.sh
+
+CUDA_DEVICES='0' \
+DURATIONS='30s' \
+PYTHON_BIN="$CONDA_PREFIX/bin/python" \
+GPU_MIN_MEMORY_GB=70 \
+GPU_MIN_FREE_MEMORY_GB=70 \
+POLL_SECONDS=60 \
+RETRY_SECONDS=300 \
+LOCK_FILE="$PWD/outputs/string_loop_30s_gpu0.lock" \
+QUEUE_LOG="$PWD/outputs/string_loop_30s_gpu0_watchdog.log" \
+bash Wan21/scripts/inference/run_string_loop_all_durations_watchdog.sh

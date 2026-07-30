@@ -48,10 +48,20 @@ LOG_CACHE_INTERVAL="${LOG_CACHE_INTERVAL:-1}"
 EVAL_STYLE_ENABLE="${EVAL_STYLE_ENABLE:-1}"
 EVAL_STYLE_MAX_FRAMES="${EVAL_STYLE_MAX_FRAMES:-96}"
 EVAL_STYLE_RESIZE_WIDTH="${EVAL_STYLE_RESIZE_WIDTH:-256}"
+EVAL_LOOP_CLOSURE_ENABLE="${EVAL_LOOP_CLOSURE_ENABLE:-auto}"
+EVAL_LOOP_MANIFEST="${EVAL_LOOP_MANIFEST:-Wan21/prompts/demos_loop_closure/manifest.json}"
+EVAL_LOOP_DURATION_LABEL="${EVAL_LOOP_DURATION_LABEL:-}"
+EVAL_LOOP_MAX_FRAMES="${EVAL_LOOP_MAX_FRAMES:-96}"
+EVAL_LOOP_RESIZE_WIDTH="${EVAL_LOOP_RESIZE_WIDTH:-256}"
+EVAL_LOOP_DEVICE="${EVAL_LOOP_DEVICE:-auto}"
+EVAL_LOOP_LPIPS_BATCH_SIZE="${EVAL_LOOP_LPIPS_BATCH_SIZE:-64}"
+EVAL_LOOP_SKIP_LPIPS="${EVAL_LOOP_SKIP_LPIPS:-0}"
 EVAL_OFFICIAL_VBENCH_ENABLE="${EVAL_OFFICIAL_VBENCH_ENABLE:-0}"
-OFFICIAL_VBENCH_ROOT="${OFFICIAL_VBENCH_ROOT:-../Forcing-KV/evaluation/VBench}"
+OFFICIAL_VBENCH_ROOT="${OFFICIAL_VBENCH_ROOT:-../VBench}"
 OFFICIAL_VBENCH_PYTHON="${OFFICIAL_VBENCH_PYTHON:-/home/hhhjyz/miniconda3/envs/vbench/bin/python}"
-OFFICIAL_VBENCH_DIMENSIONS="${OFFICIAL_VBENCH_DIMENSIONS:-subject_consistency background_consistency temporal_flickering motion_smoothness aesthetic_quality imaging_quality}"
+OFFICIAL_VBENCH_DIMENSIONS="${OFFICIAL_VBENCH_DIMENSIONS:-subject_consistency background_consistency temporal_flickering motion_smoothness dynamic_degree aesthetic_quality imaging_quality}"
+OFFICIAL_VBENCH_LOAD_LOCAL="${OFFICIAL_VBENCH_LOAD_LOCAL:-1}"
+OFFICIAL_VBENCH_CACHE_DIR="${OFFICIAL_VBENCH_CACHE_DIR:-$OFFICIAL_VBENCH_ROOT/pretrained/cache}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 SKIP_COMPLETED="${SKIP_COMPLETED:-0}"
 CONTINUE_ON_ERROR="${CONTINUE_ON_ERROR:-0}"
@@ -76,6 +86,15 @@ bool_enabled() {
   case "$1" in
     1|true|True|TRUE|yes|YES) return 0 ;;
     *) return 1 ;;
+  esac
+}
+
+loop_closure_eval_enabled() {
+  case "$EVAL_LOOP_CLOSURE_ENABLE" in
+    auto|AUTO|Auto)
+      [[ "$TRAJECTORY_PATH" == *"/demos_loop_closure/trajectories_"*".txt" ]]
+      ;;
+    *) bool_enabled "$EVAL_LOOP_CLOSURE_ENABLE" ;;
   esac
 }
 
@@ -120,6 +139,7 @@ sink_update_interval=$SINK_UPDATE_INTERVAL
 kv_bank_device=$KV_BANK_DEVICE
 kv_bank_max_blocks=$KV_BANK_MAX_BLOCKS
 retrieval_frames=$RETRIEVAL_FRAMES
+retrieval_granularity_cases=chunk,latent_frame
 retrieval_recent_frames=$RETRIEVAL_RECENT_FRAMES
 retrieval_fov_samples=$RETRIEVAL_FOV_SAMPLES
 retrieval_fov_radius=$RETRIEVAL_FOV_RADIUS
@@ -128,6 +148,9 @@ retrieval_fov_v_deg=$RETRIEVAL_FOV_V_DEG
 prope_reencode_mode=$PROPE_REENCODE_MODE
 compression_keep_ratio=$KV_COMPRESSION_KEEP_RATIO
 official_vbench=$EVAL_OFFICIAL_VBENCH_ENABLE
+loop_closure_eval=$EVAL_LOOP_CLOSURE_ENABLE
+loop_closure_manifest=$EVAL_LOOP_MANIFEST
+loop_closure_max_frames=$EVAL_LOOP_MAX_FRAMES
 EOF
 printf "seed\tcase\tinference\tevaluation\toutput_folder\n" > "$SUMMARY"
 
@@ -167,6 +190,29 @@ run_evaluation() {
   local timing_csv="$output_folder/inference_times.csv"
   local eval_dir="$output_folder/eval"
 
+  if loop_closure_eval_enabled; then
+    if [ ! -f "$EVAL_LOOP_MANIFEST" ]; then
+      echo "Loop-closure manifest not found: $EVAL_LOOP_MANIFEST" >&2
+      return 3
+    fi
+    local loop_args=(
+      --timing-csv "$timing_csv"
+      --manifest "$EVAL_LOOP_MANIFEST"
+      --output-dir "$eval_dir"
+      --max-frames-per-segment "$EVAL_LOOP_MAX_FRAMES"
+      --resize-width "$EVAL_LOOP_RESIZE_WIDTH"
+      --device "$EVAL_LOOP_DEVICE"
+      --lpips-batch-size "$EVAL_LOOP_LPIPS_BATCH_SIZE"
+    )
+    if [ -n "$EVAL_LOOP_DURATION_LABEL" ]; then
+      loop_args+=(--duration-label "$EVAL_LOOP_DURATION_LABEL")
+    fi
+    if bool_enabled "$EVAL_LOOP_SKIP_LPIPS"; then
+      loop_args+=(--skip-lpips)
+    fi
+    "$PYTHON_BIN" Wan21/scripts/evaluation/evaluate_loop_closure.py "${loop_args[@]}"
+  fi
+
   if bool_enabled "$EVAL_STYLE_ENABLE"; then
     "$PYTHON_BIN" Wan21/scripts/evaluation/evaluate_vbench_style.py \
       --timing-csv "$timing_csv" \
@@ -186,13 +232,21 @@ run_evaluation() {
     fi
     # shellcheck disable=SC2206
     local dimensions=($OFFICIAL_VBENCH_DIMENSIONS)
-    "$PYTHON_BIN" Wan21/scripts/evaluation/evaluate_vbench_official.py \
-      --timing-csv "$timing_csv" \
-      --output-dir "$eval_dir" \
-      --vbench-root "$OFFICIAL_VBENCH_ROOT" \
-      --python-bin "$OFFICIAL_VBENCH_PYTHON" \
-      --master-port "$(pick_master_port)" \
+    local official_args=(
+      --timing-csv "$timing_csv"
+      --output-dir "$eval_dir"
+      --vbench-root "$OFFICIAL_VBENCH_ROOT"
+      --python-bin "$OFFICIAL_VBENCH_PYTHON"
+      --master-port "$(pick_master_port)"
       --dimensions "${dimensions[@]}"
+    )
+    if [ -n "$OFFICIAL_VBENCH_CACHE_DIR" ]; then
+      official_args+=(--vbench-cache-dir "$OFFICIAL_VBENCH_CACHE_DIR")
+    fi
+    if bool_enabled "$OFFICIAL_VBENCH_LOAD_LOCAL"; then
+      official_args+=(--load-ckpt-from-local)
+    fi
+    "$PYTHON_BIN" Wan21/scripts/evaluation/evaluate_vbench_official.py "${official_args[@]}"
   fi
 }
 
@@ -206,6 +260,7 @@ run_case() {
   local sink_interval=0
   local kv_bank_enable=0
   local retrieval_enable=0
+  local retrieval_granularity=chunk
   local retrieval_metric=pose
   local compression_enable=0
   local compression_at_store=0
@@ -220,12 +275,24 @@ run_case() {
       sink_strategy=periodic; sink_size="$SINK_SIZE"; sink_interval="$SINK_UPDATE_INTERVAL" ;;
     bank_random_sink|bank_uniform_sink|bank_pose_sink|bank_worldkv_fov_sink)
       sink_strategy="${case_name%_sink}"; sink_size="$SINK_SIZE"; sink_interval="$SINK_UPDATE_INTERVAL"; kv_bank_enable=1 ;;
-    pose|hy_fov|hybrid)
+    pose|pose_chunk)
+      sink_strategy=fixed; sink_size="$SINK_SIZE"
+      retrieval_enable=1; retrieval_metric=pose; kv_bank_enable=1 ;;
+    pose_latent_frame)
+      sink_strategy=fixed; sink_size="$SINK_SIZE"
+      retrieval_enable=1; retrieval_granularity=latent_frame
+      retrieval_metric=pose; kv_bank_enable=1 ;;
+    hy_fov|hybrid)
       retrieval_enable=1; retrieval_metric="$case_name"; kv_bank_enable=1 ;;
-    worldkv_fov)
+    worldkv_fov|worldkv_fov_chunk)
       sink_strategy=fixed; sink_size="$SINK_SIZE"
       retrieval_enable=1; retrieval_metric=worldkv_fov; kv_bank_enable=1 ;;
+    worldkv_fov_latent_frame)
+      sink_strategy=fixed; sink_size="$SINK_SIZE"
+      retrieval_enable=1; retrieval_granularity=latent_frame
+      retrieval_metric=worldkv_fov; kv_bank_enable=1 ;;
     pose_compress_store)
+      sink_strategy=fixed; sink_size="$SINK_SIZE"
       retrieval_enable=1; retrieval_metric=pose; kv_bank_enable=1
       compression_enable=1; compression_at_store=1; compression_pooled=1 ;;
     worldkv_fov_compress_store)
@@ -275,6 +342,7 @@ run_case() {
     KV_BANK_LOG_INTERVAL="$KV_BANK_LOG_INTERVAL"
     KV_BANK_WARN_MEMORY_GB="$KV_BANK_WARN_MEMORY_GB"
     RETRIEVAL_ENABLE="$retrieval_enable"
+    RETRIEVAL_GRANULARITY="$retrieval_granularity"
     RETRIEVAL_METRIC="$retrieval_metric"
     RETRIEVAL_FRAMES="$RETRIEVAL_FRAMES"
     RETRIEVAL_RECENT_FRAMES="$RETRIEVAL_RECENT_FRAMES"

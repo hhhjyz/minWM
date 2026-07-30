@@ -121,6 +121,32 @@ def _rope_time_delta_mul_(k_chunk, freqs, delta_frames: int) -> None:
     time_ri.copy_(time_ri_new.to(time_ri.dtype))
 
 
+def _rebase_contiguous_rope_keys(
+    keys,
+    *,
+    freqs,
+    frame_seq_length: int,
+    source_start_frame: int,
+    target_start_frame: int,
+):
+    """Return contiguous, already-roped keys shifted to a virtual time origin.
+
+    The cache itself is deliberately left untouched. Inference revisits the
+    same cached context at every denoising step, so mutating it here would
+    accumulate the RoPE rotation.
+    """
+    if keys.shape[1] == 0 or not frame_seq_length or freqs is None:
+        return keys
+    if keys.shape[1] % int(frame_seq_length) != 0:
+        return keys
+    delta_frames = int(target_start_frame) - int(source_start_frame)
+    if delta_frames == 0:
+        return keys
+    rebased = keys.clone()
+    _rope_time_delta_mul_(rebased, freqs, delta_frames)
+    return rebased
+
+
 def _compose_attention_window(
     kv_cache,
     local_end_index: int,
@@ -135,14 +161,115 @@ def _compose_attention_window(
     freqs=None,
     current_end: int | None = None,
     frame_seq_length: int | None = None,
+    query_tokens: int = 0,
+    tri_region_rope_rebase: bool = False,
+    rope_train_length: int = 21,
+    rope_local_window: int = 9,
 ):
-    if retrieval_kv is None or retrieval_key not in retrieval_kv or retrieval_value not in retrieval_kv:
-        start = max(0, local_end_index - max_attention_size)
-        return kv_cache["k"][:, start:local_end_index], kv_cache["v"][:, start:local_end_index]
+    has_retrieval = (
+        retrieval_kv is not None
+        and retrieval_key in retrieval_kv
+        and retrieval_value in retrieval_kv
+    )
+    if not tri_region_rope_rebase or retrieval_key != "k":
+        if not has_retrieval:
+            start = max(0, local_end_index - max_attention_size)
+            return kv_cache["k"][:, start:local_end_index], kv_cache["v"][:, start:local_end_index]
+
+        sink_end = min(max(0, int(sink_tokens)), local_end_index)
+        sink_k = kv_cache["k"][:, :sink_end]
+        sink_v = kv_cache["v"][:, :sink_end]
+        retr_k = retrieval_kv[retrieval_key]
+        retr_v = retrieval_kv[retrieval_value]
+        if device is not None:
+            retr_k = retr_k.to(device=device)
+            retr_v = retr_v.to(device=device)
+        if dtype is not None:
+            retr_k = retr_k.to(dtype=dtype)
+            retr_v = retr_v.to(dtype=dtype)
+        retr_tokens = int(retr_k.shape[1])
+        recent_budget = max(0, int(max_attention_size) - sink_end - retr_tokens)
+        recent_start = max(sink_end, local_end_index - recent_budget)
+        recent_k = kv_cache["k"][:, recent_start:local_end_index]
+        recent_v = kv_cache["v"][:, recent_start:local_end_index]
+
+        if (
+                retrieval_key == "k"
+                and retrieval_kv.get("rope_correction", False)
+                and "src_frame_ids" in retrieval_kv
+                and freqs is not None
+                and current_end is not None
+                and frame_seq_length):
+            retr_k = retr_k.clone()
+            current_end_frame = int(current_end) // int(frame_seq_length)
+            recent_len_frames = recent_k.shape[1] // int(frame_seq_length)
+            recent_start_frame = current_end_frame - recent_len_frames
+            src_frame_ids = list(retrieval_kv["src_frame_ids"])
+            if src_frame_ids:
+                chunk_tokens = retr_tokens // len(src_frame_ids)
+                chunk_size_frames = int(retrieval_kv.get("compress_chunk_size", 0)) or max(
+                    1, chunk_tokens // int(frame_seq_length)
+                )
+                for chunk_index, src_frame_id in enumerate(src_frame_ids):
+                    virtual_frame_id = recent_start_frame - (
+                        len(src_frame_ids) - chunk_index
+                    ) * chunk_size_frames
+                    token_start = chunk_index * chunk_tokens
+                    token_end = token_start + chunk_tokens
+                    _rope_time_delta_mul_(
+                        retr_k[:, token_start:token_end],
+                        freqs,
+                        int(virtual_frame_id) - int(src_frame_id),
+                    )
+        return (
+            torch.cat([sink_k, retr_k, recent_k], dim=1),
+            torch.cat([sink_v, retr_v, recent_v], dim=1),
+        )
+
+    if freqs is None or current_end is None or not frame_seq_length:
+        raise ValueError("tri-region RoPE requires freqs, current_end, and frame_seq_length")
+    frame_seq_length = int(frame_seq_length)
+    if local_end_index % frame_seq_length or int(query_tokens) % frame_seq_length:
+        raise ValueError("tri-region RoPE requires frame-aligned cache and query tokens")
 
     sink_end = min(max(0, int(sink_tokens)), local_end_index)
     sink_k = kv_cache["k"][:, :sink_end]
     sink_v = kv_cache["v"][:, :sink_end]
+    query_frames = int(query_tokens) // frame_seq_length
+    current_end_frame = int(current_end) // frame_seq_length
+    current_start_frame = current_end_frame - query_frames
+
+    # Keep W frames immediately before the current chunk, plus the current
+    # chunk's K at the same virtual positions used by its Q.
+    available_non_sink = max(0, local_end_index - sink_end)
+    local_tokens = min(
+        available_non_sink,
+        (max(0, int(rope_local_window)) + query_frames) * frame_seq_length,
+    )
+    local_start = local_end_index - local_tokens
+    local_k = kv_cache["k"][:, local_start:local_end_index]
+    local_v = kv_cache["v"][:, local_start:local_end_index]
+    local_frames = local_tokens // frame_seq_length
+    past_local_frames = max(0, local_frames - query_frames)
+    local_source_start = current_end_frame - local_frames
+    virtual_query_start = int(rope_train_length) - query_frames + 1
+    local_target_start = virtual_query_start - past_local_frames
+    if local_target_start < 0:
+        raise ValueError(
+            f"tri-region local range starts at {local_target_start}; reduce "
+            f"rope_local_window={rope_local_window} or query chunk={query_frames}"
+        )
+    local_k = _rebase_contiguous_rope_keys(
+        local_k,
+        freqs=freqs,
+        frame_seq_length=frame_seq_length,
+        source_start_frame=local_source_start,
+        target_start_frame=local_target_start,
+    )
+
+    if not has_retrieval:
+        return torch.cat([sink_k, local_k], dim=1), torch.cat([sink_v, local_v], dim=1)
+
     retr_k = retrieval_kv[retrieval_key]
     retr_v = retrieval_kv[retrieval_value]
     if device is not None:
@@ -151,38 +278,38 @@ def _compose_attention_window(
     if dtype is not None:
         retr_k = retr_k.to(dtype=dtype)
         retr_v = retr_v.to(dtype=dtype)
-
     retr_tokens = int(retr_k.shape[1])
-    recent_budget = max(0, int(max_attention_size) - sink_end - retr_tokens)
-    recent_start = max(sink_end, local_end_index - recent_budget)
-    recent_k = kv_cache["k"][:, recent_start:local_end_index]
-    recent_v = kv_cache["v"][:, recent_start:local_end_index]
-
-    if (
-            retrieval_key == "k"
-            and retrieval_kv.get("rope_correction", False)
-            and "src_frame_ids" in retrieval_kv
-            and freqs is not None
-            and current_end is not None
-            and frame_seq_length):
-        retr_k = retr_k.clone()
-        current_end_frame = int(current_end) // int(frame_seq_length)
-        recent_len_frames = recent_k.shape[1] // int(frame_seq_length)
-        recent_start_frame = current_end_frame - recent_len_frames
-        src_frame_ids = list(retrieval_kv["src_frame_ids"])
-        if src_frame_ids:
-            chunk_tokens = retr_tokens // len(src_frame_ids)
-            chunk_size_frames = int(retrieval_kv.get("compress_chunk_size", 0)) or max(
-                1, chunk_tokens // int(frame_seq_length)
-            )
-            for chunk_index, src_frame_id in enumerate(src_frame_ids):
-                virtual_frame_id = recent_start_frame - (len(src_frame_ids) - chunk_index) * chunk_size_frames
-                delta = int(virtual_frame_id) - int(src_frame_id)
-                if delta != 0:
-                    token_start = chunk_index * chunk_tokens
-                    token_end = token_start + chunk_tokens
-                    _rope_time_delta_mul_(retr_k[:, token_start:token_end], freqs, delta)
-    return torch.cat([sink_k, retr_k, recent_k], dim=1), torch.cat([sink_v, retr_v, recent_v], dim=1)
+    src_frame_ids = list(retrieval_kv.get("src_frame_ids", []))
+    if not src_frame_ids:
+        raise ValueError("tri-region retrieval requires src_frame_ids")
+    if retr_tokens % len(src_frame_ids):
+        raise ValueError("tri-region retrieval tokens must divide evenly across src_frame_ids")
+    chunk_tokens = retr_tokens // len(src_frame_ids)
+    chunk_size_frames = int(retrieval_kv.get("compress_chunk_size", 0)) or max(
+        1, chunk_tokens // frame_seq_length
+    )
+    memory_span_frames = len(src_frame_ids) * chunk_size_frames
+    memory_start = sink_end // frame_seq_length
+    if memory_start + memory_span_frames > local_target_start:
+        raise ValueError(
+            "tri-region RoPE regions overlap: "
+            f"sink_end={memory_start}, memory_span={memory_span_frames}, "
+            f"local_start={local_target_start}"
+        )
+    retr_k = retr_k.clone()
+    for chunk_index, src_frame_id in enumerate(src_frame_ids):
+        token_start = chunk_index * chunk_tokens
+        token_end = token_start + chunk_tokens
+        target_frame = memory_start + chunk_index * chunk_size_frames
+        _rope_time_delta_mul_(
+            retr_k[:, token_start:token_end],
+            freqs,
+            int(target_frame) - int(src_frame_id),
+        )
+    return (
+        torch.cat([sink_k, retr_k, local_k], dim=1),
+        torch.cat([sink_v, retr_v, local_v], dim=1),
+    )
 
 
 class CausalWanSelfAttention(nn.Module):
@@ -192,6 +319,10 @@ class CausalWanSelfAttention(nn.Module):
                  num_heads,
                  local_attn_size=-1,
                  sink_size=0,
+                 fixed_sink_rope_rebase=False,
+                 tri_region_rope_rebase=False,
+                 rope_train_length=21,
+                 rope_local_window=9,
                  qk_norm=True,
                  eps=1e-6):
         assert dim % num_heads == 0
@@ -201,6 +332,11 @@ class CausalWanSelfAttention(nn.Module):
         self.head_dim = dim // num_heads
         self.local_attn_size = local_attn_size
         self.sink_size = sink_size
+        self.tri_region_rope_rebase = bool(
+            tri_region_rope_rebase or fixed_sink_rope_rebase
+        )
+        self.rope_train_length = int(rope_train_length)
+        self.rope_local_window = int(rope_local_window)
         self.qk_norm = qk_norm
         self.eps = eps
         self.max_attention_size = 31200 if local_attn_size == -1 else local_attn_size * 1560
@@ -423,6 +559,19 @@ class CausalWanSelfAttention(nn.Module):
                 q, grid_sizes, freqs, start_frame=current_start_frame).type_as(v)
             roped_key = causal_rope_apply(
                 k, grid_sizes, freqs, start_frame=current_start_frame).type_as(v)
+            tri_region_active = (
+                self.tri_region_rope_rebase
+                and current_start_frame >= self.sink_size
+            )
+            if tri_region_active:
+                query_frames = roped_query.shape[1] // frame_seqlen
+                virtual_query_start = self.rope_train_length - query_frames + 1
+                roped_query = roped_query.clone()
+                _rope_time_delta_mul_(
+                    roped_query,
+                    freqs,
+                    virtual_query_start - current_start_frame,
+                )
 
             current_end = current_start + roped_query.shape[1]
             sink_tokens = self.sink_size * frame_seqlen
@@ -465,6 +614,10 @@ class CausalWanSelfAttention(nn.Module):
                     freqs=freqs,
                     current_end=current_end,
                     frame_seq_length=frame_seqlen,
+                    query_tokens=num_new_tokens,
+                    tri_region_rope_rebase=tri_region_active,
+                    rope_train_length=self.rope_train_length,
+                    rope_local_window=self.rope_local_window,
                 )
             )
             kv_cache["global_end_index"].fill_(current_end)
@@ -552,6 +705,10 @@ class CausalWanAttentionBlock(nn.Module):
                  num_heads,
                  local_attn_size=-1,
                  sink_size=0,
+                 fixed_sink_rope_rebase=False,
+                 tri_region_rope_rebase=False,
+                 rope_train_length=21,
+                 rope_local_window=9,
                  qk_norm=True,
                  cross_attn_norm=False,
                  eps=1e-6):
@@ -566,7 +723,11 @@ class CausalWanAttentionBlock(nn.Module):
 
         # layers
         self.norm1 = WanLayerNorm(dim, eps)
-        self.self_attn = CausalWanSelfAttention(dim, num_heads, local_attn_size, sink_size, qk_norm, eps)
+        self.self_attn = CausalWanSelfAttention(
+            dim, num_heads, local_attn_size, sink_size,
+            fixed_sink_rope_rebase, tri_region_rope_rebase,
+            rope_train_length, rope_local_window, qk_norm, eps,
+        )
         self.norm3 = WanLayerNorm(
             dim, eps,
             elementwise_affine=True) if cross_attn_norm else nn.Identity()
@@ -728,6 +889,10 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                  num_layers=32,
                  local_attn_size=-1,
                  sink_size=0,
+                 fixed_sink_rope_rebase=False,
+                 tri_region_rope_rebase=False,
+                 rope_train_length=21,
+                 rope_local_window=9,
                  qk_norm=True,
                  cross_attn_norm=True,
                  eps=1e-6):
@@ -761,6 +926,15 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                 Window size for temporal local attention (-1 indicates global attention)
             sink_size (`int`, *optional*, defaults to 0):
                 Size of the attention sink, we keep the first `sink_size` frames unchanged when rolling the KV cache
+            fixed_sink_rope_rebase (`bool`, *optional*, defaults to False):
+                Deprecated alias for `tri_region_rope_rebase`
+            tri_region_rope_rebase (`bool`, *optional*, defaults to False):
+                Map sink, retrieval, local K, and current Q into bounded,
+                disjoint virtual RoPE regions
+            rope_train_length (`int`, *optional*, defaults to 21):
+                Virtual RoPE position assigned to the final current query frame
+            rope_local_window (`int`, *optional*, defaults to 9):
+                Number of recent frames mapped immediately before the query
             qk_norm (`bool`, *optional*, defaults to True):
                 Enable query/key normalization
             cross_attn_norm (`bool`, *optional*, defaults to False):
@@ -805,7 +979,10 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         cross_attn_type = 't2v_cross_attn' if model_type == 't2v' else 'i2v_cross_attn'
         self.blocks = nn.ModuleList([
             CausalWanAttentionBlock(cross_attn_type, dim, ffn_dim, num_heads,
-                                    local_attn_size, sink_size, qk_norm, cross_attn_norm, eps)
+                                    local_attn_size, sink_size, fixed_sink_rope_rebase,
+                                    tri_region_rope_rebase, rope_train_length,
+                                    rope_local_window,
+                                    qk_norm, cross_attn_norm, eps)
             for _ in range(num_layers)
         ])
 

@@ -26,6 +26,10 @@ LOG_CACHE_STATE="${LOG_CACHE_STATE:-0}"
 LOG_CACHE_INTERVAL="${LOG_CACHE_INTERVAL:-1}"
 SINK_STRATEGY="${SINK_STRATEGY:-none}"
 SINK_SIZE="${SINK_SIZE:-0}"
+FIXED_SINK_ROPE_REBASE="${FIXED_SINK_ROPE_REBASE:-0}"
+TRI_REGION_ROPE_REBASE="${TRI_REGION_ROPE_REBASE:-$FIXED_SINK_ROPE_REBASE}"
+ROPE_TRAIN_LENGTH="${ROPE_TRAIN_LENGTH:-21}"
+ROPE_LOCAL_WINDOW="${ROPE_LOCAL_WINDOW:-9}"
 SINK_UPDATE_INTERVAL="${SINK_UPDATE_INTERVAL:-0}"
 SINK_BANK_SEED="${SINK_BANK_SEED:-0}"
 KV_BANK_ENABLE="${KV_BANK_ENABLE:-0}"
@@ -34,6 +38,7 @@ KV_BANK_MAX_BLOCKS="${KV_BANK_MAX_BLOCKS:-0}"
 KV_BANK_LOG_INTERVAL="${KV_BANK_LOG_INTERVAL:-1}"
 KV_BANK_WARN_MEMORY_GB="${KV_BANK_WARN_MEMORY_GB:-16}"
 RETRIEVAL_ENABLE="${RETRIEVAL_ENABLE:-0}"
+RETRIEVAL_GRANULARITY="${RETRIEVAL_GRANULARITY:-chunk}"
 RETRIEVAL_METRIC="${RETRIEVAL_METRIC:-pose}"
 RETRIEVAL_FRAMES="${RETRIEVAL_FRAMES:-0}"
 RETRIEVAL_RECENT_FRAMES="${RETRIEVAL_RECENT_FRAMES:-0}"
@@ -76,12 +81,17 @@ if [ "$KV_BANK_ENABLE" = "1" ] || [ "$KV_BANK_ENABLE" = "true" ] || [ "$KV_BANK_
   KV_BANK_ARGS="--kv_bank_enable $KV_BANK_ARGS"
 fi
 
-RETRIEVAL_ARGS="--retrieval_metric $RETRIEVAL_METRIC --retrieval_frames $RETRIEVAL_FRAMES --retrieval_recent_frames $RETRIEVAL_RECENT_FRAMES --retrieval_fov_samples $RETRIEVAL_FOV_SAMPLES --retrieval_fov_radius $RETRIEVAL_FOV_RADIUS --retrieval_fov_h_deg $RETRIEVAL_FOV_H_DEG --retrieval_fov_v_deg $RETRIEVAL_FOV_V_DEG --retrieval_hybrid_fov_weight $RETRIEVAL_HYBRID_FOV_WEIGHT"
+RETRIEVAL_ARGS="--retrieval_granularity $RETRIEVAL_GRANULARITY --retrieval_metric $RETRIEVAL_METRIC --retrieval_frames $RETRIEVAL_FRAMES --retrieval_recent_frames $RETRIEVAL_RECENT_FRAMES --retrieval_fov_samples $RETRIEVAL_FOV_SAMPLES --retrieval_fov_radius $RETRIEVAL_FOV_RADIUS --retrieval_fov_h_deg $RETRIEVAL_FOV_H_DEG --retrieval_fov_v_deg $RETRIEVAL_FOV_V_DEG --retrieval_hybrid_fov_weight $RETRIEVAL_HYBRID_FOV_WEIGHT"
 if [ "$RETRIEVAL_ENABLE" = "1" ] || [ "$RETRIEVAL_ENABLE" = "true" ] || [ "$RETRIEVAL_ENABLE" = "True" ]; then
   RETRIEVAL_ARGS="--retrieval_enable $RETRIEVAL_ARGS"
 fi
 if [ "$RETRIEVAL_ROPE_CORRECTION" = "1" ] || [ "$RETRIEVAL_ROPE_CORRECTION" = "true" ] || [ "$RETRIEVAL_ROPE_CORRECTION" = "True" ]; then
   RETRIEVAL_ARGS="$RETRIEVAL_ARGS --retrieval_rope_correction"
+fi
+
+SINK_REBASE_ARGS="--rope_train_length $ROPE_TRAIN_LENGTH --rope_local_window $ROPE_LOCAL_WINDOW"
+if [ "$TRI_REGION_ROPE_REBASE" = "1" ] || [ "$TRI_REGION_ROPE_REBASE" = "true" ] || [ "$TRI_REGION_ROPE_REBASE" = "True" ]; then
+  SINK_REBASE_ARGS="--tri_region_rope_rebase $SINK_REBASE_ARGS"
 fi
 
 COMPRESSION_ARGS="--kv_compression_keep_ratio $KV_COMPRESSION_KEEP_RATIO"
@@ -102,7 +112,7 @@ if [ "$KV_COMPRESSION_DYNAMIC_ENABLE" = "1" ] || [ "$KV_COMPRESSION_DYNAMIC_ENAB
 fi
 COMPRESSION_ARGS="$COMPRESSION_ARGS --kv_compression_dynamic_min_keep $KV_COMPRESSION_DYNAMIC_MIN_KEEP --kv_compression_dynamic_max_keep $KV_COMPRESSION_DYNAMIC_MAX_KEEP --kv_compression_dynamic_translation_scale $KV_COMPRESSION_DYNAMIC_TRANSLATION_SCALE --kv_compression_dynamic_rotation_scale $KV_COMPRESSION_DYNAMIC_ROTATION_SCALE --kv_compression_dynamic_motion_weight $KV_COMPRESSION_DYNAMIC_MOTION_WEIGHT"
 
-NUM_GPUS_PER_NODE=1
+NUM_GPUS_PER_NODE="${NUM_GPUS_PER_NODE:-1}"
 NNODES=${WORLD_SIZE:-1}
 NODE_RANK=${RANK:-0}
 MASTER_ADDR=${MASTER_ADDR:-"localhost"}
@@ -117,6 +127,7 @@ echo "  Trajectory: ${TRAJECTORY_PATH:-$TRAJECTORY}"
 echo "  Sink:       strategy=$SINK_STRATEGY size=$SINK_SIZE update_interval=$SINK_UPDATE_INTERVAL bank_seed=$SINK_BANK_SEED"
 echo "  KV bank:    enabled=$KV_BANK_ENABLE device=$KV_BANK_DEVICE max_blocks=$KV_BANK_MAX_BLOCKS"
 echo "  Retrieval:  enabled=$RETRIEVAL_ENABLE metric=$RETRIEVAL_METRIC frames=$RETRIEVAL_FRAMES recent_exclusion=$RETRIEVAL_RECENT_FRAMES rope_correction=$RETRIEVAL_ROPE_CORRECTION"
+echo "  Tri RoPE:   enabled=$TRI_REGION_ROPE_REBASE train_length=$ROPE_TRAIN_LENGTH local_window=$ROPE_LOCAL_WINDOW"
 echo "  PRoPE:      reencode_mode=$PROPE_REENCODE_MODE"
 echo "  Compression enabled=$KV_COMPRESSION_ENABLE keep_ratio=$KV_COMPRESSION_KEEP_RATIO at_store=$KV_COMPRESSION_AT_STORE pooled=$KV_COMPRESSION_POOLED"
 echo "  Dynamic compression enabled=$KV_COMPRESSION_DYNAMIC_ENABLE min=$KV_COMPRESSION_DYNAMIC_MIN_KEEP max=$KV_COMPRESSION_DYNAMIC_MAX_KEEP trans_scale=$KV_COMPRESSION_DYNAMIC_TRANSLATION_SCALE rot_scale=$KV_COMPRESSION_DYNAMIC_ROTATION_SCALE motion_weight=$KV_COMPRESSION_DYNAMIC_MOTION_WEIGHT"
@@ -141,6 +152,7 @@ torchrun \
   --sink_size "$SINK_SIZE" \
   --sink_update_interval "$SINK_UPDATE_INTERVAL" \
   --sink_bank_seed "$SINK_BANK_SEED" \
+  $SINK_REBASE_ARGS \
   --sp_size $SP_SIZE \
   --prope_reencode_mode "$PROPE_REENCODE_MODE" \
   $LOG_ARGS \

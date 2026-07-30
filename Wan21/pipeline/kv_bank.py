@@ -41,6 +41,23 @@ class KVBankBlock:
     motion_score: Optional[float] = None
 
 
+@dataclass(frozen=True)
+class KVBankFrameRef:
+    block_index: int
+    frame_offset: int
+
+
+def normalize_retrieval_granularity(granularity: str) -> str:
+    granularity = str(granularity or "chunk").lower().strip()
+    aliases = {"block": "chunk", "frame": "latent_frame", "latent-frame": "latent_frame"}
+    granularity = aliases.get(granularity, granularity)
+    if granularity not in {"chunk", "latent_frame"}:
+        raise ValueError(
+            f"Unknown retrieval_granularity={granularity!r}; expected chunk/latent_frame"
+        )
+    return granularity
+
+
 def _tensor_bytes(tensor: Optional[torch.Tensor]) -> int:
     if tensor is None:
         return 0
@@ -589,6 +606,197 @@ class KVBank:
 
         return payload
 
+    def select_retrieval_frames(
+        self,
+        *,
+        current_viewmats: Optional[torch.Tensor],
+        current_frame_start: int,
+        retrieval_frames: int,
+        metric: str = "pose",
+        fov_samples: int = 8192,
+        fov_radius: float = 8.0,
+        fov_h_deg: float = 60.0,
+        fov_v_deg: float = 35.0,
+        hybrid_fov_weight: float = 0.5,
+        recent_frames: int = 0,
+        sink_size_frames: int = 0,
+        return_details: bool = False,
+    ) -> list[KVBankFrameRef] | tuple[list[KVBankFrameRef], dict[str, object]]:
+        """Select individual latent frames, even when they share a stored bank block."""
+        empty = {
+            "candidate_indices": [],
+            "candidate_block_ids": [],
+            "candidate_frame_starts": [],
+            "selected_indices": [],
+            "selected_block_ids": [],
+            "selected_frame_starts": [],
+            "distances": [],
+        }
+        if not self.enabled or not self.blocks or retrieval_frames <= 0:
+            return ([], empty) if return_details else []
+        if any(block.stored_compressed for block in self.blocks):
+            raise ValueError(
+                "latent_frame retrieval is incompatible with store-time KV compression; "
+                "disable --kv_compression_at_store"
+            )
+
+        metric = normalize_retrieval_metric(metric)
+        if metric == "recent_only":
+            return ([], empty) if return_details else []
+
+        candidates: list[KVBankFrameRef] = []
+        candidate_viewmats = []
+        for block_index, block in enumerate(self.blocks):
+            frame_count = block.frame_end - block.frame_start
+            if block.viewmats is None:
+                continue
+            for frame_offset in range(frame_count):
+                frame_id = block.frame_start + frame_offset
+                if frame_id < sink_size_frames or frame_id >= current_frame_start:
+                    continue
+                if recent_frames > 0 and frame_id >= current_frame_start - recent_frames:
+                    continue
+                candidates.append(KVBankFrameRef(block_index, frame_offset))
+                candidate_viewmats.append(block.viewmats[:, frame_offset:frame_offset + 1])
+
+        if not candidates or current_viewmats is None:
+            details = dict(empty)
+            details["candidate_indices"] = [
+                [ref.block_index, ref.frame_offset] for ref in candidates
+            ]
+            details["candidate_block_ids"] = [
+                self.blocks[ref.block_index].block_id for ref in candidates
+            ]
+            details["candidate_frame_starts"] = [
+                self.blocks[ref.block_index].frame_start + ref.frame_offset for ref in candidates
+            ]
+            return ([], details) if return_details else []
+
+        current_viewmats = current_viewmats.detach().float().cpu()
+        points = None
+        if metric in {"worldkv_fov", "hy_fov", "hybrid"}:
+            points = generate_deterministic_points_in_sphere(
+                int(fov_samples), float(fov_radius), device=torch.device("cpu"),
+                dtype=torch.float32,
+            )
+        distances = retrieval_block_distances(
+            current_viewmats,
+            candidate_viewmats,
+            metric=metric,
+            points=points,
+            fov_h_deg=fov_h_deg,
+            fov_v_deg=fov_v_deg,
+            fov_radius=fov_radius,
+            hybrid_fov_weight=hybrid_fov_weight,
+        )
+        ranked_positions = select_topk_indices(
+            list(range(len(candidates))), distances, int(retrieval_frames)
+        )
+        selected = [candidates[position] for position in ranked_positions]
+        details = {
+            "candidate_indices": [[ref.block_index, ref.frame_offset] for ref in candidates],
+            "candidate_block_ids": [
+                self.blocks[ref.block_index].block_id for ref in candidates
+            ],
+            "candidate_frame_starts": [
+                self.blocks[ref.block_index].frame_start + ref.frame_offset for ref in candidates
+            ],
+            "selected_indices": [[ref.block_index, ref.frame_offset] for ref in selected],
+            "selected_block_ids": [
+                self.blocks[ref.block_index].block_id for ref in selected
+            ],
+            "selected_frame_starts": [
+                self.blocks[ref.block_index].frame_start + ref.frame_offset for ref in selected
+            ],
+            "distances": distances.detach().float().cpu().tolist(),
+        }
+        return (selected, details) if return_details else selected
+
+    def get_frame_retrieval_payload(
+        self,
+        selected_frames: list[KVBankFrameRef],
+        layer_index: int,
+        *,
+        branch: str = "main",
+        device: torch.device | str | None = None,
+        include_prope: bool = False,
+        frame_seq_length: int = 1560,
+        rope_correction: bool = False,
+        prope_reencode_mode: str = "none",
+        current_viewmats: Optional[torch.Tensor] = None,
+        current_Ks: Optional[torch.Tensor] = None,
+    ) -> Optional[dict[str, torch.Tensor | list[int] | bool | int]]:
+        if not selected_frames:
+            return None
+        device = torch.device(device) if device is not None else None
+        mode = normalize_prope_reencode_mode(prope_reencode_mode)
+        k_parts, v_parts, prope_k_parts, prope_v_parts = [], [], [], []
+        block_ids, src_frame_ids = [], []
+        reencoded_any = False
+        entries = [
+            self.blocks[ref.block_index].branches[branch][layer_index]
+            for ref in selected_frames
+        ]
+        has_prope = include_prope and all(
+            entry.prope_k is not None and entry.prope_v is not None for entry in entries
+        )
+        for ref in selected_frames:
+            block = self.blocks[ref.block_index]
+            entry = block.branches[branch][layer_index]
+            start = ref.frame_offset * frame_seq_length
+            end = start + frame_seq_length
+            if end > entry.k.shape[1] or end > entry.v.shape[1]:
+                raise ValueError(
+                    f"frame slice [{start}:{end}] exceeds stored KV tokens "
+                    f"for block={block.block_id}, layer={layer_index}"
+                )
+            k_parts.append(entry.k[:, start:end].to(device=device))
+            v_parts.append(entry.v[:, start:end].to(device=device))
+            block_ids.append(block.block_id)
+            src_frame_ids.append(block.frame_start + ref.frame_offset)
+            if has_prope:
+                prope_k = entry.prope_k[:, start:end].to(device=device)
+                prope_v = entry.prope_v[:, start:end].to(device=device)
+                if mode == "current":
+                    src_viewmats = block.viewmats[:, ref.frame_offset:ref.frame_offset + 1]
+                    src_Ks = (
+                        block.Ks[:, ref.frame_offset:ref.frame_offset + 1]
+                        if block.Ks is not None else None
+                    )
+                    dst_mid = current_viewmats.shape[1] // 2
+                    dst_viewmats = current_viewmats[:, dst_mid:dst_mid + 1]
+                    dst_Ks = (
+                        current_Ks[:, dst_mid:dst_mid + 1]
+                        if current_Ks is not None else None
+                    )
+                    prope_k, prope_v, did_reencode = reencode_prope_kv_to_current(
+                        prope_k,
+                        prope_v,
+                        src_viewmats=src_viewmats,
+                        src_Ks=src_Ks,
+                        dst_viewmats=dst_viewmats,
+                        dst_Ks=dst_Ks,
+                    )
+                    reencoded_any = reencoded_any or did_reencode
+                prope_k_parts.append(prope_k)
+                prope_v_parts.append(prope_v)
+        payload = {
+            "k": torch.cat(k_parts, dim=1),
+            "v": torch.cat(v_parts, dim=1),
+            "block_ids": block_ids,
+            "src_frame_ids": src_frame_ids,
+            "chunk_size_frames": 1,
+            "compress_chunk_size": 1,
+            "stored_compressed": False,
+            "rope_correction": bool(rope_correction),
+            "prope_reencode_mode": mode,
+            "prope_reencoded": reencoded_any,
+        }
+        if has_prope and len(prope_k_parts) == len(selected_frames):
+            payload["prope_k"] = torch.cat(prope_k_parts, dim=1)
+            payload["prope_v"] = torch.cat(prope_v_parts, dim=1)
+        return payload
+
     def select_retrieval_blocks(
         self,
         *,
@@ -703,6 +911,43 @@ class KVBank:
                 compression_keep_ratio=compression_keep_ratio,
                 compression_anchor_rotate=compression_anchor_rotate,
                 compression_pooled=compression_pooled,
+                frame_seq_length=frame_seq_length,
+                rope_correction=rope_correction,
+                prope_reencode_mode=prope_reencode_mode,
+                current_viewmats=current_viewmats,
+                current_Ks=current_Ks,
+            )
+            if payload is None:
+                return None
+            payloads.append(payload)
+        return payloads
+
+    def get_frame_retrieval_payloads(
+        self,
+        selected_frames: list[KVBankFrameRef],
+        *,
+        branch: str,
+        device: torch.device | str | None,
+        include_prope: bool,
+        frame_seq_length: int,
+        rope_correction: bool = False,
+        prope_reencode_mode: str = "none",
+        current_viewmats: Optional[torch.Tensor] = None,
+        current_Ks: Optional[torch.Tensor] = None,
+    ) -> Optional[list[dict[str, torch.Tensor | list[int] | bool | int]]]:
+        if not selected_frames:
+            return None
+        first_block = self.blocks[selected_frames[0].block_index]
+        if branch not in first_block.branches:
+            return None
+        payloads = []
+        for layer_index in range(len(first_block.branches[branch])):
+            payload = self.get_frame_retrieval_payload(
+                selected_frames,
+                layer_index,
+                branch=branch,
+                device=device,
+                include_prope=include_prope,
                 frame_seq_length=frame_seq_length,
                 rope_correction=rope_correction,
                 prope_reencode_mode=prope_reencode_mode,

@@ -70,6 +70,26 @@ bash Wan21/scripts/inference/run_profiled_smoke_causal_camera.sh
 30s: TRAJECTORY_PATH=.../trajectories_30s.txt NUM_OUTPUT_FRAMES=120
 ```
 
+## 闭环指标评测
+
+统一实验 runner 会识别本目录的 trajectory 文件，并自动执行 MAG-style LPIPS
+最近邻闭环指标。已有视频也可以单独评测：
+
+```bash
+python Wan21/scripts/evaluation/evaluate_loop_closure.py \
+  --timing-csv outputs/demo_loop_10s_seed0/inference_times.csv \
+  --manifest Wan21/prompts/demos_loop_closure/manifest.json \
+  --output-dir outputs/demo_loop_10s_seed0/eval \
+  --device auto
+```
+
+结果写入 `loop_closure_metrics.csv` 和 `loop_closure_metrics.json`。其中
+`psnr/ssim/lpips` 按 MAG-Bench 口径计算：每个 revisit 帧先找 LPIPS 最近的
+outbound 帧，再用同一匹配对计算 PSNR/SSIM；`mag_psnr/ssim/lpips` 是相同结果
+的显式别名。解释这些指标时还应同时检查 match unique ratio 和时序误差。初始
+pose 与 closure pose 虽然数值上完全相同，但像素指标衡量的是生成内容是否真的
+回到一致的视觉状态。
+
 ## 运行四种时长的 baseline
 
 ```bash

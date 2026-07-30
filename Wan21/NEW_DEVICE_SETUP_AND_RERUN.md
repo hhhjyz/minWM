@@ -347,7 +347,7 @@ conda activate ling
 tmux new-session -d -s minwm_loop_watchdog \
   "cd '$PWD' && env \
    PYTHON_BIN='$CONDA_PREFIX/bin/python' \
-   GPU_MIN_MEMORY_GB=70 \
+   GPU_MIN_MEMORY_GB=40 \
    POLL_SECONDS=60 \
    RETRY_SECONDS=300 \
    bash Wan21/scripts/inference/run_string_loop_all_durations_watchdog.sh"
@@ -408,13 +408,14 @@ python -m pip install \
 python -m pip install -e ./VBench
 ```
 
-当前默认评测的六个质量维度不需要 Detectron2：
+当前默认评测的七个基础质量维度不需要 Detectron2：
 
 ```text
 subject_consistency
 background_consistency
 temporal_flickering
 motion_smoothness
+dynamic_degree
 aesthetic_quality
 imaging_quality
 ```
@@ -434,6 +435,8 @@ python Wan21/scripts/evaluation/run_official_vbench_batch.py \
   --minwm-root "$PWD" \
   --vbench-root ../VBench \
   --vbench-python "$HOME/miniconda3/envs/vbench/bin/python" \
+  --vbench-cache-dir ../VBench/pretrained/cache \
+  --load-ckpt-from-local \
   --output-dir outputs/official_vbench_all_durations
 ```
 
@@ -466,7 +469,7 @@ python -m pip install --no-build-isolation \
   'detectron2@git+https://github.com/facebookresearch/detectron2.git'
 ```
 
-Detectron2 对 CUDA/Torch 版本敏感，不属于当前六个质量维度的必要依赖。
+Detectron2 对 CUDA/Torch 版本敏感，不属于当前七个基础质量维度的必要依赖。
 
 ### 11.5 watchdog 一直显示 `waiting_for_gpu`
 

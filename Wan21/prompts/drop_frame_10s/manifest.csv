@@ -1,0 +1,31 @@
+id,motion_level,scene,trajectory
+01,small,analog clock and blinking LED,w*39
+02,small,library candle and sleeping cat,d*39
+03,small,low-amplitude Newton cradle,j*39
+04,small,hourglass sand,i*39
+05,small,calm pond ripple,a*39
+06,small,slow pottery wheel,l*39
+07,small,slow museum orrery,u*39
+08,small,snow and wind vane,dn*39
+09,small,kettle steam,s*39
+10,small,sequential control-room LEDs,k*39
+11,medium,bakery conveyor,"w*26,j*13"
+12,medium,city tram,"d*20,w*19"
+13,medium,chef slicing cucumber,"j*13,w*26"
+14,medium,waterfall,"a*13,w*13,j*13"
+15,medium,seaside cyclist,"l*20,w*19"
+16,medium,pendulum clock,"i*13,j*13,w*13"
+17,medium,airport baggage carousel,"d*13,l*13,w*13"
+18,medium,farmer among sunflowers,"u*13,w*13,j*13"
+19,medium,aquarium fish and bubbles,"k*13,d*13,w*13"
+20,medium,robotic pick-and-place arm,"w*13,l*13,dn*13"
+21,large,busy highway,"w*15,j*12,w*12"
+22,large,express train platform,"d*13,w*13,l*13"
+23,large,downhill mountain bike,"u*10,w*19,j*10"
+24,large,storm waves and lighthouse,"a*10,i*10,w*19"
+25,large,night carnival,"j*10,w*10,l*9,w*10"
+26,large,bird flock and strong wind,"dn*13,d*13,w*13"
+27,large,racing pit crew,"w*20,l*19"
+28,large,high-speed bottling line,"i*13,w*13,j*13"
+29,large,rainy urban crosswalk,"d*10,k*10,w*19"
+30,large,whitewater mountain river,"l*13,w*13,u*13"

@@ -92,6 +92,10 @@ parser.add_argument("--log_cache_state", action="store_true", help="Log per-bloc
 parser.add_argument("--log_cache_interval", type=int, default=1, help="Log every N generated blocks when --log_cache_state is enabled.")
 parser.add_argument("--sink_strategy", type=str, default="none", choices=["none", "fixed", "periodic", "bank_random", "bank_uniform", "bank_pose", "bank_worldkv_fov", "bank_fov"], help="Sink-frame KV cache strategy.")
 parser.add_argument("--sink_size", type=int, default=0, help="Number of latent frames reserved as sink frames.")
+parser.add_argument("--fixed_sink_rope_rebase", action="store_true", help="Deprecated alias for --tri_region_rope_rebase.")
+parser.add_argument("--tri_region_rope_rebase", action="store_true", help="Map sink, retrieval memory, recent K, and current Q/K into bounded virtual RoPE regions.")
+parser.add_argument("--rope_train_length", type=int, default=21, help="Virtual RoPE position of the final current query frame.")
+parser.add_argument("--rope_local_window", type=int, default=9, help="Number of recent frames placed immediately before the current query region.")
 parser.add_argument("--sink_update_interval", type=int, default=0, help="For periodic/bank sink, update sink every N generated blocks.")
 parser.add_argument("--sink_bank_seed", type=int, default=0, help="Deterministic seed for bank_random sink selection.")
 parser.add_argument("--kv_bank_enable", action="store_true", help="Store clean per-block KV in a sidecar bank without retrieval.")
@@ -100,6 +104,7 @@ parser.add_argument("--kv_bank_max_blocks", type=int, default=0, help="Maximum r
 parser.add_argument("--kv_bank_log_interval", type=int, default=1, help="Log KV bank state every N generated blocks.")
 parser.add_argument("--kv_bank_warn_memory_gb", type=float, default=16.0, help="Warn when projected KV bank storage exceeds this many GB. 0 disables warning.")
 parser.add_argument("--retrieval_enable", action="store_true", help="Enable WorldKV-style [sink | retrieved | recent] attention window.")
+parser.add_argument("--retrieval_granularity", choices=["chunk", "latent_frame"], default="chunk", help="Select whole generated chunks or individual latent frames from the KV bank.")
 parser.add_argument("--retrieval_metric", choices=["recent_only", "pose", "worldkv_fov", "hy_fov", "hybrid", "fov"], default="pose", help="Retrieval metric: WorldKV pose, WorldKV FOV, HY-WorldPlay FOV, or hybrid.")
 parser.add_argument("--retrieval_frames", type=int, default=0, help="Number of latent frames to retrieve from KV bank.")
 parser.add_argument("--retrieval_recent_frames", type=int, default=0, help="Exclude bank blocks that overlap the most recent N latent frames before current block. 0 disables this exclusion.")
@@ -174,6 +179,16 @@ config.log_cache_state = args.log_cache_state
 config.log_cache_interval = max(1, args.log_cache_interval)
 if args.sink_strategy != "none":
     assert args.sink_size > 0, "--sink_size must be > 0 when sink_strategy is enabled"
+tri_region_rope_rebase = bool(
+    args.tri_region_rope_rebase or args.fixed_sink_rope_rebase
+)
+if tri_region_rope_rebase:
+    assert args.sink_strategy == "fixed", "tri-region RoPE requires --sink_strategy fixed"
+    assert args.rope_train_length > 0, "--rope_train_length must be positive"
+    assert args.rope_local_window >= 0, "--rope_local_window must be non-negative"
+    assert args.sink_size < args.rope_train_length - args.rope_local_window, (
+        "tri-region RoPE requires room between sink and local regions"
+    )
 if args.sink_strategy in {"periodic", "bank_random", "bank_uniform", "bank_pose", "bank_worldkv_fov", "bank_fov"}:
     assert args.sink_update_interval > 0, "--sink_update_interval must be > 0 for updating sink strategies"
 model_kwargs = config.get("model_kwargs", {})
@@ -184,6 +199,10 @@ if args.sink_size > 0 and local_attn_size != -1:
     )
 effective_sink_size = int(args.sink_size) if args.sink_strategy != "none" else 0
 config.model_kwargs.sink_size = effective_sink_size
+config.model_kwargs.fixed_sink_rope_rebase = False
+config.model_kwargs.tri_region_rope_rebase = tri_region_rope_rebase
+config.model_kwargs.rope_train_length = int(args.rope_train_length)
+config.model_kwargs.rope_local_window = int(args.rope_local_window)
 config.sink_strategy = args.sink_strategy
 config.sink_update_interval = int(args.sink_update_interval)
 config.sink_bank_seed = int(args.sink_bank_seed)
@@ -193,6 +212,7 @@ config.kv_bank_max_blocks = max(0, int(args.kv_bank_max_blocks))
 config.kv_bank_log_interval = max(1, int(args.kv_bank_log_interval))
 config.kv_bank_warn_memory_gb = max(0.0, float(args.kv_bank_warn_memory_gb))
 config.retrieval_enable = bool(args.retrieval_enable)
+config.retrieval_granularity = args.retrieval_granularity
 config.retrieval_metric = args.retrieval_metric
 config.retrieval_frames = max(0, int(args.retrieval_frames))
 config.retrieval_recent_frames = max(0, int(args.retrieval_recent_frames))
@@ -365,6 +385,7 @@ if local_rank == 0:
         "current_frame_start",
         "current_num_frames",
         "metric",
+        "granularity",
         "retrieval_frames",
         "rope_correction",
         "prope_reencode_mode",
@@ -667,6 +688,7 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
                     "current_frame_start",
                     "current_num_frames",
                     "metric",
+                    "granularity",
                     "retrieval_frames",
                     "rope_correction",
                     "prope_reencode_mode",

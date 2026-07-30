@@ -98,6 +98,8 @@ def run_dimension(
     dimension: str,
     long: bool,
     master_port: int,
+    load_ckpt_from_local: bool,
+    env_overrides: dict[str, str],
     extra_args: list[str],
 ) -> None:
     if long:
@@ -131,10 +133,13 @@ def run_dimension(
             str(output_path),
             *extra_args,
         ]
+        if load_ckpt_from_local:
+            cmd.extend(["--load_ckpt_from_local", "True"])
     if not script.exists():
         raise FileNotFoundError(f"Cannot find official VBench entrypoint: {script}")
 
     env = os.environ.copy()
+    env.update(env_overrides)
     env["MASTER_PORT"] = str(master_port)
     print("[official-vbench]", " ".join(cmd), flush=True)
     subprocess.run(cmd, cwd=str(vbench_root), env=env, check=True)
@@ -197,6 +202,29 @@ def main() -> None:
     parser.add_argument("--long", action="store_true", help="Use VBench-Long eval_long.py.")
     parser.add_argument("--copy-videos", action="store_true", help="Copy videos instead of symlinking.")
     parser.add_argument("--master-port", type=int, default=38600)
+    parser.add_argument(
+        "--load-ckpt-from-local",
+        action="store_true",
+        help="Pass --load_ckpt_from_local True to official VBench.",
+    )
+    parser.add_argument(
+        "--vbench-cache-dir",
+        type=Path,
+        default=None,
+        help="Directory used as VBENCH_CACHE_DIR for official VBench checkpoints.",
+    )
+    parser.add_argument(
+        "--torch-home",
+        type=Path,
+        default=None,
+        help="Optional TORCH_HOME used by torch hub downloads/cache.",
+    )
+    parser.add_argument(
+        "--hf-home",
+        type=Path,
+        default=None,
+        help="Optional HF_HOME used by Hugging Face downloads/cache.",
+    )
     parser.add_argument("--extra-arg", action="append", default=[], help="Extra raw args appended to official VBench command.")
     args = parser.parse_args()
 
@@ -205,6 +233,13 @@ def main() -> None:
     video_dir, manifest = prepare_video_dir(args.timing_csv, args.output_dir, copy_videos=args.copy_videos)
     raw_dir = args.output_dir / ("official_vbench_long_raw" if args.long else "official_vbench_raw")
     raw_dir.mkdir(parents=True, exist_ok=True)
+    env_overrides = {}
+    if args.vbench_cache_dir is not None:
+        env_overrides["VBENCH_CACHE_DIR"] = str(args.vbench_cache_dir.resolve())
+    if args.torch_home is not None:
+        env_overrides["TORCH_HOME"] = str(args.torch_home.resolve())
+    if args.hf_home is not None:
+        env_overrides["HF_HOME"] = str(args.hf_home.resolve())
 
     for offset, dimension in enumerate(dimensions):
         master_port = find_free_port(args.master_port + offset)
@@ -216,6 +251,8 @@ def main() -> None:
             dimension=dimension,
             long=args.long,
             master_port=master_port,
+            load_ckpt_from_local=bool(args.load_ckpt_from_local),
+            env_overrides=env_overrides,
             extra_args=args.extra_arg,
         )
 
@@ -236,6 +273,8 @@ def main() -> None:
                 "vbench_root": str(args.vbench_root),
                 "timing_csv": str(args.timing_csv),
                 "dimensions": dimensions,
+                "load_ckpt_from_local": bool(args.load_ckpt_from_local),
+                "vbench_cache_dir": str(args.vbench_cache_dir) if args.vbench_cache_dir else None,
                 "num_videos": len(manifest),
                 "summary": summary,
                 "videos": rows,

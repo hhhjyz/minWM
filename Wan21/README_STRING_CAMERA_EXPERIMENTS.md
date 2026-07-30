@@ -252,7 +252,60 @@ bash Wan21/scripts/inference/run_string_camera_experiments.sh
 
 ## 6. 自动评测
 
-### 6.1 轻量无参考指标
+### 6.1 Loop-closure PSNR / SSIM / LPIPS
+
+`demos_loop_closure` 的后半段严格沿前半段的逆轨迹返回，因此可以把同一生成
+视频的 outbound 段作为内部参考，把 revisit 段作为待测段。runner 在
+`TRAJECTORY_PATH` 指向 `prompts/demos_loop_closure/trajectories_*.txt` 时会自动
+启用该评测，也可显式设置：
+
+```bash
+EVAL_LOOP_CLOSURE_ENABLE=1
+EVAL_LOOP_MANIFEST=Wan21/prompts/demos_loop_closure/manifest.json
+EVAL_LOOP_MAX_FRAMES=96
+EVAL_LOOP_RESIZE_WIDTH=256
+EVAL_LOOP_DEVICE=auto
+```
+
+已有结果可以单独评测：
+
+```bash
+python Wan21/scripts/evaluation/evaluate_loop_closure.py \
+  --timing-csv outputs/string_loop_10s_all_cases_seed0/seed_0/baseline/inference_times.csv \
+  --manifest Wan21/prompts/demos_loop_closure/manifest.json \
+  --output-dir outputs/string_loop_10s_all_cases_seed0/seed_0/baseline/eval \
+  --device auto
+```
+
+脚本使用 manifest 中的精确 closure frame，将闭环区间在 turnaround 处分为：
+
+```text
+outbound（内部参考） | turnaround（不计分） | revisit（待测）
+```
+
+主要报告：
+
+- `psnr`、`ssim`、`lpips`：按 MAG-Bench 口径，每个 revisit 帧先寻找 LPIPS
+  最近的 outbound 帧，再在同一匹配上计算 PSNR、SSIM，容忍运动速度和时序偏差；
+- `mag_psnr`、`mag_ssim`、`mag_lpips`：与上面的主指标相同，作为显式 MAG-style
+  字段保留；
+- `closure_*`：初始帧和精确闭环帧的端点指标；
+- `match_unique_ratio`、`match_temporal_mae_normalized`、
+  `match_reverse_violation_ratio`：检测重复匹配和错误时序，避免最近邻指标虚高。
+
+结果保存在：
+
+```text
+<case>/eval/loop_closure_metrics.csv
+<case>/eval/loop_closure_metrics.json
+```
+
+LPIPS 使用 AlexNet，需要 `lpips` 包及对应权重。如果 LPIPS 初始化失败，脚本仍会
+保留端点的 PSNR/SSIM，但跳过 MAG-style 的 `psnr`、`ssim`、`lpips`；使用
+`--require-lpips` 可改为直接报错。这里的 outbound 是同一次生成的内部参考，不是真实视频 GT，因此这些
+指标应称为视觉闭环/记忆一致性指标，不能表述成对真实数据的重建指标。
+
+### 6.2 轻量无参考指标
 
 实验 runner 默认启用轻量 VBench-style proxy 指标：
 
@@ -271,15 +324,16 @@ EVAL_STYLE_RESIZE_WIDTH=256
 
 这些是内部 proxy 指标，不是官方 VBench 分数。
 
-### 6.2 官方 VBench
+### 6.3 官方 VBench
 
 字符串 prompt 可以直接交给官方 VBench 的 `custom_input` 模式，不需要使用 VBench 官方 prompt。
 
 ```bash
 EVAL_OFFICIAL_VBENCH_ENABLE=1 \
-OFFICIAL_VBENCH_ROOT=../Forcing-KV/evaluation/VBench \
+OFFICIAL_VBENCH_ROOT=../VBench \
 OFFICIAL_VBENCH_PYTHON=/home/hhhjyz/miniconda3/envs/vbench/bin/python \
-OFFICIAL_VBENCH_DIMENSIONS="subject_consistency background_consistency temporal_flickering motion_smoothness aesthetic_quality imaging_quality" \
+OFFICIAL_VBENCH_CACHE_DIR=../VBench/pretrained/cache \
+OFFICIAL_VBENCH_DIMENSIONS="subject_consistency background_consistency temporal_flickering motion_smoothness dynamic_degree aesthetic_quality imaging_quality" \
 bash Wan21/scripts/inference/run_string_camera_experiments.sh
 ```
 
@@ -290,11 +344,14 @@ bash Wan21/scripts/inference/run_string_camera_experiments.sh
 <case>/eval/official_vbench_metrics.json
 ```
 
-`dynamic_degree` 依赖 RAFT 权重，确认相应权重可用后再加入 `OFFICIAL_VBENCH_DIMENSIONS`。
+默认使用 `OFFICIAL_VBENCH_ROOT/pretrained/cache` 作为官方权重 cache，并传入
+`--load_ckpt_from_local`，避免每次评测重新下载权重。
 
-由于不再使用配对参考视频，PSNR、SSIM 和 LPIPS 不属于当前默认评测。这些指标需要逐帧对齐的真实参考视频，不能用来评价任意 prompt 生成结果。
+对于不具备精确逆向轨迹的任意 prompt 视频，仍然不能把同视频帧任意配对后计算的
+PSNR、SSIM 或 LPIPS 当成有参考生成质量指标；此时应使用本节的无参考 VBench
+指标。上述 loop-closure 指标只适用于 manifest 明确给出闭环对应关系的轨迹。
 
-### 6.3 长时长实验 watchdog
+### 6.4 长时长实验 watchdog
 
 当 GPU 资源可能在完整 A100 和 MIG 分片之间切换时，可以使用 watchdog。
 它会检查 PyTorch 实际可见的显存，默认低于 70GB 时等待，不会在 10GB MIG
@@ -399,7 +456,7 @@ outputs/string_loop_all_durations_watchdog.log
 | `EVAL_OFFICIAL_VBENCH_ENABLE` | `0` | 自动运行官方 VBench |
 | `OFFICIAL_VBENCH_ROOT` | `../Forcing-KV/evaluation/VBench` | 官方 VBench 仓库 |
 | `OFFICIAL_VBENCH_PYTHON` | vbench 环境 Python | VBench Python 解释器 |
-| `OFFICIAL_VBENCH_DIMENSIONS` | 六个质量维度 | 空格分隔的官方指标 |
+| `OFFICIAL_VBENCH_DIMENSIONS` | 七个基础质量维度 | 空格分隔的官方指标 |
 | `SKIP_COMPLETED` | `0` | 检测完整 `inference_times.csv` 后跳过生成 |
 | `CONTINUE_ON_ERROR` | `0` | 单个 case 失败后是否继续 |
 | `DRY_RUN` | `0` | 只打印命令，不运行 |

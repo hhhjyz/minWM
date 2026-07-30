@@ -15,6 +15,7 @@ DEFAULT_DIMS = [
     "background_consistency",
     "temporal_flickering",
     "motion_smoothness",
+    "dynamic_degree",
     "aesthetic_quality",
     "imaging_quality",
 ]
@@ -53,6 +54,8 @@ def main() -> None:
     parser.add_argument("--log-dir", type=Path, default=Path("outputs/official_vbench_logs"))
     parser.add_argument("--dimensions", nargs="*", default=DEFAULT_DIMS)
     parser.add_argument("--base-port", type=int, default=42000)
+    parser.add_argument("--load-ckpt-from-local", action="store_true")
+    parser.add_argument("--vbench-cache-dir", type=Path, default=None)
     parser.add_argument("--compile-pdf", action="store_true")
     parser.add_argument("--force", action="store_true", help="Re-run cases even when official metrics already exist.")
     args = parser.parse_args()
@@ -97,6 +100,10 @@ def main() -> None:
             "--dimensions",
             *args.dimensions,
         ]
+        if args.load_ckpt_from_local:
+            cmd.append("--load-ckpt-from-local")
+        if args.vbench_cache_dir is not None:
+            cmd.extend(["--vbench-cache-dir", str(args.vbench_cache_dir.resolve())])
         print(f"[{idx}] official VBench: {rel}", flush=True)
         with log_path.open("w", encoding="utf-8") as log:
             log.write(" ".join(cmd) + "\n")
