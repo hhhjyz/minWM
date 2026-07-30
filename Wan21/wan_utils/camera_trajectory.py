@@ -14,6 +14,12 @@ Trajectory string format (each step = 0.08 unit translation or 3° rotation):
   l*N  -- yaw right     (rotate around Y, negative)
   i*N  -- pitch up      (rotate around X, negative)
   k*N  -- pitch down    (rotate around X, positive)
+  n*N  -- no camera motion
+
+An optional multiplier can be applied to a segment with ``@``.  For example,
+``j@2.5*40`` rotates left by 7.5° per step for an exact 300° turn.  This is
+primarily useful when adapting trajectories whose duration and total rotation
+are specified independently, such as MBench-A.
 
 Example: "w*19" -> 20-frame forward dolly (1 identity + 19 steps).
 Chain segments: "w*10,d*9", "w*9,j*10"
@@ -49,6 +55,7 @@ _MOTIONS = {
     "l":  {"yaw":      _ROT_STEP},   # yaw right
     "i":  {"pitch":    _ROT_STEP},   # pitch up
     "k":  {"pitch":   -_ROT_STEP},   # pitch down
+    "n":  {},                         # stationary / padding
 }
 
 
@@ -89,13 +96,22 @@ def parse_trajectory(traj_str: str) -> np.ndarray:
     motions = []
     for seg in segments:
         seg = seg.strip()
-        m = re.fullmatch(r"([a-z]+)\*(\d+)", seg)
+        m = re.fullmatch(
+            r"([a-z]+)(?:@([0-9]+(?:\.[0-9]+)?))?\*(\d+)",
+            seg,
+        )
         if m is None:
-            raise ValueError(f"Cannot parse trajectory segment: '{seg}'. Expected 'w*19'.")
-        key, n = m.group(1), int(m.group(2))
+            raise ValueError(
+                f"Cannot parse trajectory segment: '{seg}'. "
+                "Expected 'w*19' or 'j@2.5*40'."
+            )
+        key, multiplier_raw, n_raw = m.groups()
+        n = int(n_raw)
         if key not in _MOTIONS:
             raise ValueError(f"Unknown direction '{key}'. Valid: {list(_MOTIONS.keys())}")
-        motions.extend([_MOTIONS[key]] * n)
+        multiplier = float(multiplier_raw) if multiplier_raw is not None else 1.0
+        move = {name: value * multiplier for name, value in _MOTIONS[key].items()}
+        motions.extend([move] * n)
 
     c2w_list = _generate_c2w_trajectory(motions)
     T = len(c2w_list)

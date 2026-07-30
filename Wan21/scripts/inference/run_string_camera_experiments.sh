@@ -314,7 +314,11 @@ run_case() {
   fi
 
   local master_port
-  master_port="$(pick_master_port)"
+  if bool_enabled "$DRY_RUN"; then
+    master_port="${MASTER_PORT:-29500}"
+  else
+    master_port="$(pick_master_port)"
+  fi
   echo "=== seed=$seed case=$case_name output=$output_folder ==="
 
   local env_args=(

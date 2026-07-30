@@ -154,6 +154,8 @@ All weights live under `./ckpts/` after download.
 For the current Wan Action2V prompt + action-string experiments, including sink, KV bank,
 pose/FOV retrieval, compression, profiling, and VBench evaluation, see
 [`Wan21/README_STRING_CAMERA_EXPERIMENTS.md`](Wan21/README_STRING_CAMERA_EXPERIMENTS.md).
+For preparing, generating, packaging, and evaluating these memory cases on MBench-A, see
+[`Wan21/MBENCHA_ADAPTATION.md`](Wan21/MBENCHA_ADAPTATION.md).
 For migration to a new machine and resumable 10s/15s/20s/30s runs, see
 [`Wan21/NEW_DEVICE_SETUP_AND_RERUN.md`](Wan21/NEW_DEVICE_SETUP_AND_RERUN.md).
 
