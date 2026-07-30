@@ -629,7 +629,7 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
         # Step 4: Decode the output
         if return_video:
             video = self.vae.decode_to_pixel(output)
-            video = (video * 0.5 + 0.5).clamp(0, 1)
+            video.mul_(0.5).add_(0.5).clamp_(0, 1)
 
             if return_latents:
                 return video, output

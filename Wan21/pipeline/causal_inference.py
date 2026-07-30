@@ -573,7 +573,10 @@ class CausalInferencePipeline(torch.nn.Module):
             output -= mean 
         # Step 4: Decode the output
         video = self.vae.decode_to_pixel(output, use_cache=False)
-        video = (video * 0.5 + 0.5).clamp(0, 1)
+        # A 25 s MBench-A sample decodes to a multi-GiB tensor.  The
+        # out-of-place expression previously used here allocated another
+        # tensor of the same size and exhausted 48 GiB GPUs after decoding.
+        video.mul_(0.5).add_(0.5).clamp_(0, 1)
 
         if profile:
             # End VAE timing and synchronize CUDA

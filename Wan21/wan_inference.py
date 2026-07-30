@@ -144,10 +144,10 @@ if args.sp_size > 1:
     device = torch.device(f"cuda:{local_rank}")
     world_size = dist.get_world_size()
 elif "LOCAL_RANK" in os.environ:
-    dist.init_process_group(backend='nccl')
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
     device = torch.device(f"cuda:{local_rank}")
+    dist.init_process_group(backend="nccl", device_id=device)
     world_size = dist.get_world_size()
 
 else:
@@ -731,4 +731,5 @@ if local_rank == 0:
     with open(timing_json_path, "w", encoding="utf-8") as _f:
         json.dump(timing_rows, _f, indent=2, ensure_ascii=False)
 
-       
+if dist.is_initialized():
+    dist.destroy_process_group()

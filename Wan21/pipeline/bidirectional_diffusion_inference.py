@@ -94,7 +94,7 @@ class BidirectionalDiffusionInferencePipeline(torch.nn.Module):
         self.last_chunk0_latency = time.perf_counter() - _chunk0_t0
 
         video = self.vae.decode_to_pixel(x0)
-        video = (video * 0.5 + 0.5).clamp(0, 1)
+        video.mul_(0.5).add_(0.5).clamp_(0, 1)
 
         del sample_scheduler
 

@@ -83,7 +83,7 @@ class BidirectionalInferencePipeline(torch.nn.Module):
         self.last_chunk0_latency = time.perf_counter() - _chunk0_t0
 
         video = self.vae.decode_to_pixel(pred_image_or_video)
-        video = (video * 0.5 + 0.5).clamp(0, 1)
+        video.mul_(0.5).add_(0.5).clamp_(0, 1)
         if return_latents:
             return video, pred_image_or_video
         return video
