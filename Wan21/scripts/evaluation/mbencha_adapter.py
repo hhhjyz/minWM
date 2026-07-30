@@ -56,8 +56,6 @@ def _conditions(raw: str, length: str) -> list[str]:
                 f"choose from {sorted(SUPPORTED_ACTIONS)}"
             )
         result.append(condition)
-    if not result:
-        raise ValueError("At least one condition is required")
     return result
 
 
@@ -109,26 +107,82 @@ def _iter_samples(dataset_root: Path, subsets: set[str]):
             yield subset_dir.name, sample_dir.name, caption.strip()
 
 
+def _load_official_assignments(path: Path) -> list[dict]:
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"Official MBench-A assignment manifest not found: {path}. "
+            "Download MBench-A/models/hy_worldplay/samples.jsonl or use "
+            "--cartesian explicitly for a custom condition sweep."
+        )
+    rows = []
+    for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        if not line.strip():
+            continue
+        row = json.loads(line)
+        missing = {"subset", "sample_id", "condition_id"} - row.keys()
+        if missing:
+            raise ValueError(f"{path}:{lineno} is missing fields: {sorted(missing)}")
+        rows.append(row)
+    return rows
+
+
 def prepare(args: argparse.Namespace) -> None:
     dataset_root = args.dataset_root.resolve()
     if _read_dataset_id(dataset_root) != "mbencha":
         raise ValueError(f"{dataset_root} is not an MBench-A dataset")
     conditions = _conditions(args.conditions, args.length)
+    condition_filter = set(conditions)
     subsets = {value.strip() for value in args.subsets.split(",") if value.strip()}
+    sample_captions = {
+        (subset, sample_id): caption
+        for subset, sample_id, caption in _iter_samples(dataset_root, subsets)
+    }
     rows = []
-    for subset, sample_id, caption in _iter_samples(dataset_root, subsets):
-        for condition_id in conditions:
-            action = condition_id[: -(len(args.length) + 1)]
-            rows.append(
-                {
-                    "prompt_index": len(rows),
-                    "subset": subset,
-                    "sample_id": sample_id,
-                    "condition_id": condition_id,
-                    "prompt": caption,
-                    "trajectory": _trajectory(action, args.num_output_frames),
-                }
+    if args.cartesian:
+        if not conditions:
+            raise ValueError("--conditions is required with --cartesian")
+        assigned_items = (
+            (subset, sample_id, condition_id)
+            for subset, sample_id in sample_captions
+            for condition_id in conditions
+        )
+    else:
+        assignment_path = (
+            args.assignment_manifest.resolve()
+            if args.assignment_manifest
+            else dataset_root / "models" / "hy_worldplay" / "samples.jsonl"
+        )
+        assigned_items = (
+            (row["subset"], row["sample_id"], row["condition_id"])
+            for row in _load_official_assignments(assignment_path)
+            if (not subsets or row["subset"] in subsets)
+            and (not condition_filter or row["condition_id"] in condition_filter)
+        )
+
+    for subset, sample_id, condition_id in assigned_items:
+        caption = sample_captions.get((subset, sample_id))
+        if caption is None:
+            raise ValueError(
+                f"Assignment {subset}/{sample_id}/{condition_id} has no matching sample.json"
             )
+        condition_length = condition_id.rsplit("_", 1)[-1]
+        if condition_length != args.length:
+            raise ValueError(
+                f"Condition {condition_id!r} does not match --length {args.length!r}"
+            )
+        action = condition_id[: -(len(args.length) + 1)]
+        if action not in SUPPORTED_ACTIONS:
+            raise ValueError(f"Unsupported MBench-A action in assignment: {action!r}")
+        rows.append(
+            {
+                "prompt_index": len(rows),
+                "subset": subset,
+                "sample_id": sample_id,
+                "condition_id": condition_id,
+                "prompt": caption,
+                "trajectory": _trajectory(action, args.num_output_frames),
+            }
+        )
     if args.limit is not None:
         rows = rows[: args.limit]
     if not rows:
@@ -250,7 +304,18 @@ def build_parser() -> argparse.ArgumentParser:
     prep.add_argument("--length", choices=["10s", "25s"], required=True)
     prep.add_argument(
         "--conditions",
-        default="left_then_right,right_then_left,forward_then_backward,left_360,right_360",
+        default="",
+        help="Optional condition filter; empty means all official assignments.",
+    )
+    prep.add_argument(
+        "--assignment-manifest",
+        type=Path,
+        help="Official samples.jsonl; defaults to models/hy_worldplay/samples.jsonl.",
+    )
+    prep.add_argument(
+        "--cartesian",
+        action="store_true",
+        help="Custom ablation mode: combine every selected sample with every condition.",
     )
     prep.add_argument("--subsets", default="environment,human,object,causal")
     prep.add_argument("--num-output-frames", type=int, required=True)

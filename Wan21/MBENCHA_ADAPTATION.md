@@ -35,7 +35,9 @@ MBench 指标范围内。
 MBench-A-Setup/samples/{subset}/{sample_id}/sample.json
 ```
 
-读取 `caption`，并与指定 MBench-A condition 做笛卡尔组合，生成：
+读取 `caption`，并默认按照官方
+`models/hy_worldplay/samples.jsonl` 中的 547 条 sample-condition assignment
+生成：
 
 ```text
 adapter_root/
@@ -46,6 +48,9 @@ adapter_root/
 
 三者按 `prompt_index` 严格对齐。`manifest.jsonl` 保存
 `subset/sample_id/condition_id`，供推理后反向包装结果。
+
+只有显式传入 `--cartesian` 时，adapter 才会将样本与 `--conditions` 做
+笛卡尔组合；该模式用于自定义消融，不属于官方 MBench-A 协议。
 
 ### 2.2 动作语义转换
 
@@ -117,7 +122,6 @@ export PYTHONPATH="$PWD/Wan21:$PWD/shared:${PYTHONPATH:-}"
 MBENCHA_ROOT=/absolute/path/to/MBench-A-Setup \
 LENGTH=25s \
 NUM_OUTPUT_FRAMES=400 \
-CONDITIONS=left_then_right \
 SUBSETS=environment \
 LIMIT=2 \
 CASES="baseline pose worldkv_fov pose_compress_store" \
@@ -145,7 +149,6 @@ outputs/mbencha_adapter/25s/manifest.jsonl
 MBENCHA_ROOT=/absolute/path/to/MBench-A-Setup \
 LENGTH=25s \
 NUM_OUTPUT_FRAMES=400 \
-CONDITIONS=left_then_right,right_then_left,forward_then_backward,left_360,right_360 \
 SUBSETS=environment,human,object,causal \
 SEEDS="0 1 2" \
 CASES="baseline fixed_sink pose pose_latent_frame worldkv_fov worldkv_fov_latent_frame hy_fov hybrid pose_compress_store worldkv_fov_compress_store worldkv_fov_dynamic_compress_store" \
@@ -162,8 +165,8 @@ bash Wan21/scripts/inference/run_mbencha_experiments.sh
 2. 首轮可只跑 `environment,object`，它们对空间回访与物体记忆最敏感。
 3. 正式表格至少使用 3 个 seed，并分别报告均值和标准差。
 4. 不要在 case 间修改 checkpoint、condition、帧数或采样参数。
-5. `left_720/right_720/left_1080/right_1080` 也受支持，但只应在 MBench
-   setup 确实定义/需要这些 condition 时加入。
+5. 官方 manifest 当前包含 273 条 `left_then_right_25s` 和 274 条
+   `right_then_left_25s`。其他 condition 只用于显式 `--cartesian` 自定义实验。
 
 如果推理已在其他方式下完成，可以单独包装：
 
