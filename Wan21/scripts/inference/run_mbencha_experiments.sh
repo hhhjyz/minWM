@@ -18,6 +18,9 @@ PACKAGE_AFTER_RUN="${PACKAGE_AFTER_RUN:-1}"
 LINK_MODE="${LINK_MODE:-symlink}"
 LIMIT="${LIMIT:-}"
 CASES="${CASES:-baseline fixed_sink pose pose_latent_frame worldkv_fov worldkv_fov_latent_frame hy_fov hybrid pose_compress_store worldkv_fov_compress_store worldkv_fov_dynamic_compress_store}"
+RETRIEVAL_FRAMES="${RETRIEVAL_FRAMES:-12}"
+COMPRESSED_RETRIEVAL_FRAMES="${COMPRESSED_RETRIEVAL_FRAMES:-20}"
+DYNAMIC_COMPRESSED_RETRIEVAL_FRAMES="${DYNAMIC_COMPRESSED_RETRIEVAL_FRAMES:-24}"
 
 prepare_args=(
   prepare
@@ -40,6 +43,9 @@ export NUM_OUTPUT_FRAMES
 export MAX_PROMPTS=0
 export PROMPT_START=0
 export CASES
+export RETRIEVAL_FRAMES
+export COMPRESSED_RETRIEVAL_FRAMES
+export DYNAMIC_COMPRESSED_RETRIEVAL_FRAMES
 export EVAL_STYLE_ENABLE="${EVAL_STYLE_ENABLE:-0}"
 export EVAL_LOOP_CLOSURE_ENABLE=0
 export EVAL_OFFICIAL_VBENCH_ENABLE=0

@@ -27,6 +27,8 @@ KV_BANK_LOG_INTERVAL="${KV_BANK_LOG_INTERVAL:-1}"
 KV_BANK_WARN_MEMORY_GB="${KV_BANK_WARN_MEMORY_GB:-128}"
 
 RETRIEVAL_FRAMES="${RETRIEVAL_FRAMES:-12}"
+COMPRESSED_RETRIEVAL_FRAMES="${COMPRESSED_RETRIEVAL_FRAMES:-$RETRIEVAL_FRAMES}"
+DYNAMIC_COMPRESSED_RETRIEVAL_FRAMES="${DYNAMIC_COMPRESSED_RETRIEVAL_FRAMES:-$COMPRESSED_RETRIEVAL_FRAMES}"
 RETRIEVAL_RECENT_FRAMES="${RETRIEVAL_RECENT_FRAMES:-8}"
 RETRIEVAL_FOV_SAMPLES="${RETRIEVAL_FOV_SAMPLES:-8192}"
 RETRIEVAL_FOV_RADIUS="${RETRIEVAL_FOV_RADIUS:-8.0}"
@@ -139,6 +141,8 @@ sink_update_interval=$SINK_UPDATE_INTERVAL
 kv_bank_device=$KV_BANK_DEVICE
 kv_bank_max_blocks=$KV_BANK_MAX_BLOCKS
 retrieval_frames=$RETRIEVAL_FRAMES
+compressed_retrieval_frames=$COMPRESSED_RETRIEVAL_FRAMES
+dynamic_compressed_retrieval_frames=$DYNAMIC_COMPRESSED_RETRIEVAL_FRAMES
 retrieval_granularity_cases=chunk,latent_frame
 retrieval_recent_frames=$RETRIEVAL_RECENT_FRAMES
 retrieval_fov_samples=$RETRIEVAL_FOV_SAMPLES
@@ -262,6 +266,7 @@ run_case() {
   local retrieval_enable=0
   local retrieval_granularity=chunk
   local retrieval_metric=pose
+  local retrieval_frames="$RETRIEVAL_FRAMES"
   local compression_enable=0
   local compression_at_store=0
   local compression_pooled=0
@@ -294,14 +299,17 @@ run_case() {
     pose_compress_store)
       sink_strategy=fixed; sink_size="$SINK_SIZE"
       retrieval_enable=1; retrieval_metric=pose; kv_bank_enable=1
+      retrieval_frames="$COMPRESSED_RETRIEVAL_FRAMES"
       compression_enable=1; compression_at_store=1; compression_pooled=1 ;;
     worldkv_fov_compress_store)
       sink_strategy=fixed; sink_size="$SINK_SIZE"
       retrieval_enable=1; retrieval_metric=worldkv_fov; kv_bank_enable=1
+      retrieval_frames="$COMPRESSED_RETRIEVAL_FRAMES"
       compression_enable=1; compression_at_store=1; compression_pooled=1 ;;
     worldkv_fov_dynamic_compress_store)
       sink_strategy=fixed; sink_size="$SINK_SIZE"
       retrieval_enable=1; retrieval_metric=worldkv_fov; kv_bank_enable=1
+      retrieval_frames="$DYNAMIC_COMPRESSED_RETRIEVAL_FRAMES"
       compression_enable=1; compression_at_store=1; compression_pooled=1; compression_dynamic=1 ;;
     *) echo "Unknown case: $case_name" >&2; return 2 ;;
   esac
@@ -348,7 +356,7 @@ run_case() {
     RETRIEVAL_ENABLE="$retrieval_enable"
     RETRIEVAL_GRANULARITY="$retrieval_granularity"
     RETRIEVAL_METRIC="$retrieval_metric"
-    RETRIEVAL_FRAMES="$RETRIEVAL_FRAMES"
+    RETRIEVAL_FRAMES="$retrieval_frames"
     RETRIEVAL_RECENT_FRAMES="$RETRIEVAL_RECENT_FRAMES"
     RETRIEVAL_FOV_SAMPLES="$RETRIEVAL_FOV_SAMPLES"
     RETRIEVAL_FOV_RADIUS="$RETRIEVAL_FOV_RADIUS"

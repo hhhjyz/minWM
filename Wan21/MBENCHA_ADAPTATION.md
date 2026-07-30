@@ -152,6 +152,9 @@ NUM_OUTPUT_FRAMES=400 \
 SUBSETS=environment,human,object,causal \
 SEEDS="0 1 2" \
 CASES="baseline fixed_sink pose pose_latent_frame worldkv_fov worldkv_fov_latent_frame hy_fov hybrid pose_compress_store worldkv_fov_compress_store worldkv_fov_dynamic_compress_store" \
+RETRIEVAL_FRAMES=12 \
+COMPRESSED_RETRIEVAL_FRAMES=20 \
+DYNAMIC_COMPRESSED_RETRIEVAL_FRAMES=24 \
 RUN_ROOT=./outputs/mbencha_25s \
 MODEL_PREFIX=minwm \
 SKIP_COMPLETED=1 \
@@ -167,6 +170,33 @@ bash Wan21/scripts/inference/run_mbencha_experiments.sh
 4. 不要在 case 间修改 checkpoint、condition、帧数或采样参数。
 5. 官方 manifest 当前包含 273 条 `left_then_right_25s` 和 274 条
    `right_then_left_25s`。其他 condition 只用于显式 `--cartesian` 自定义实验。
+
+### Retrieval region 与 compression token budget
+
+MBench runner 默认不是让所有 case 使用相同 raw retrieval region，而是近似保持
+compression 前后的物理 retrieval token budget：
+
+| Case | Raw retrieval region |
+|---|---:|
+| `pose` / `worldkv_fov` | 12 frames |
+| `pose_compress_store` / `worldkv_fov_compress_store` | 20 frames |
+| `worldkv_fov_dynamic_compress_store` | 24 frames |
+
+静态压缩采用 4-frame chunk：1 个 anchor frame 完整保留，其他 3 帧按
+`keep_ratio=0.5` 保留，因此每个 chunk 的有效比例约为
+`(1 + 3 × 0.5) / 4 = 0.625`。20 个 raw frames 压缩后约等价于 12.5 个
+未压缩 frames，与 12-frame baseline 接近。动态压缩的实际 keep ratio 随运动
+变化，24 frames 是参考 compression budget ablation 使用的初始预算，正式分析
+时应以 `retrieval_events.csv/jsonl` 中实际 `retrieved_tokens_per_layer` 为准。
+
+如需测量“相同历史覆盖下 compression 本身的信息损失”，可以覆盖为：
+
+```bash
+RETRIEVAL_FRAMES=12 \
+COMPRESSED_RETRIEVAL_FRAMES=12 \
+DYNAMIC_COMPRESSED_RETRIEVAL_FRAMES=12 \
+...
+```
 
 如果推理已在其他方式下完成，可以单独包装：
 
