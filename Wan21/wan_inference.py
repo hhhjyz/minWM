@@ -92,10 +92,10 @@ parser.add_argument("--log_cache_state", action="store_true", help="Log per-bloc
 parser.add_argument("--log_cache_interval", type=int, default=1, help="Log every N generated blocks when --log_cache_state is enabled.")
 parser.add_argument("--sink_strategy", type=str, default="none", choices=["none", "fixed", "periodic", "bank_random", "bank_uniform", "bank_pose", "bank_worldkv_fov", "bank_fov"], help="Sink-frame KV cache strategy.")
 parser.add_argument("--sink_size", type=int, default=0, help="Number of latent frames reserved as sink frames.")
-parser.add_argument("--fixed_sink_rope_rebase", action="store_true", help="Deprecated alias for --tri_region_rope_rebase.")
-parser.add_argument("--tri_region_rope_rebase", action="store_true", help="Map sink, retrieval memory, recent K, and current Q/K into bounded virtual RoPE regions.")
-parser.add_argument("--rope_train_length", type=int, default=21, help="Virtual RoPE position of the final current query frame.")
-parser.add_argument("--rope_local_window", type=int, default=9, help="Number of recent frames placed immediately before the current query region.")
+parser.add_argument("--fixed_sink_rope_rebase", action="store_true", help="Rebase only fixed-sink K immediately before the real-time local K/Q window; retrieval must be disabled.")
+parser.add_argument("--tri_region_rope_rebase", action="store_true", help="Use ordinary RoPE without retrieval until current_start reaches rope_train_length, then enable retrieval and map sink/retrieval/recent/current into bounded virtual RoPE regions.")
+parser.add_argument("--rope_train_length", type=int, default=19, help="Virtual RoPE position T of the final current query frame.")
+parser.add_argument("--rope_local_window", type=int, default=4, help="Number of recent frames before the current denoising chunk; with a 4-frame chunk this maps recent+current to 12..19.")
 parser.add_argument("--sink_update_interval", type=int, default=0, help="For periodic/bank sink, update sink every N generated blocks.")
 parser.add_argument("--sink_bank_seed", type=int, default=0, help="Deterministic seed for bank_random sink selection.")
 parser.add_argument("--kv_bank_enable", action="store_true", help="Store clean per-block KV in a sidecar bank without retrieval.")
@@ -179,9 +179,14 @@ config.log_cache_state = args.log_cache_state
 config.log_cache_interval = max(1, args.log_cache_interval)
 if args.sink_strategy != "none":
     assert args.sink_size > 0, "--sink_size must be > 0 when sink_strategy is enabled"
-tri_region_rope_rebase = bool(
-    args.tri_region_rope_rebase or args.fixed_sink_rope_rebase
+fixed_sink_rope_rebase = bool(args.fixed_sink_rope_rebase)
+tri_region_rope_rebase = bool(args.tri_region_rope_rebase)
+assert not (fixed_sink_rope_rebase and tri_region_rope_rebase), (
+    "--fixed_sink_rope_rebase and --tri_region_rope_rebase are mutually exclusive"
 )
+if fixed_sink_rope_rebase:
+    assert args.sink_strategy == "fixed", "fixed-sink RoPE rebase requires --sink_strategy fixed"
+    assert not args.retrieval_enable, "fixed-sink RoPE rebase requires retrieval to be disabled"
 if tri_region_rope_rebase:
     assert args.sink_strategy == "fixed", "tri-region RoPE requires --sink_strategy fixed"
     assert args.rope_train_length > 0, "--rope_train_length must be positive"
@@ -199,7 +204,7 @@ if args.sink_size > 0 and local_attn_size != -1:
     )
 effective_sink_size = int(args.sink_size) if args.sink_strategy != "none" else 0
 config.model_kwargs.sink_size = effective_sink_size
-config.model_kwargs.fixed_sink_rope_rebase = False
+config.model_kwargs.fixed_sink_rope_rebase = fixed_sink_rope_rebase
 config.model_kwargs.tri_region_rope_rebase = tri_region_rope_rebase
 config.model_kwargs.rope_train_length = int(args.rope_train_length)
 config.model_kwargs.rope_local_window = int(args.rope_local_window)

@@ -20,12 +20,66 @@ PYTHON_BIN="${PYTHON_BIN:-python}"
 SKIP_COMPLETED="${SKIP_COMPLETED:-1}"
 EVAL_LOOP_CLOSURE_ENABLE="${EVAL_LOOP_CLOSURE_ENABLE:-1}"
 EVAL_LOOP_SKIP_LPIPS="${EVAL_LOOP_SKIP_LPIPS:-0}"
+# This experiment needs roughly 41 GiB at its observed peak.  Keep some
+# headroom so that a run does not start on an already occupied GPU.
+MIN_FREE_GPU_MEMORY_MIB="${MIN_FREE_GPU_MEMORY_MIB:-44000}"
+GPU_MEMORY_POLL_SECONDS="${GPU_MEMORY_POLL_SECONDS:-30}"
+GPU_WAIT_TIMEOUT_SECONDS="${GPU_WAIT_TIMEOUT_SECONDS:--1}"
+GPU_LOCK_DIR="${GPU_LOCK_DIR:-/tmp/minwm_gpu_locks}"
 
 bool_enabled() {
   case "$1" in
     1|true|True|TRUE|yes|YES) return 0 ;;
     *) return 1 ;;
   esac
+}
+
+acquire_gpu_lease() {
+  if [[ "$CUDA_VISIBLE_DEVICES" == *","* ]]; then
+    echo "This runner expects exactly one CUDA device, got: $CUDA_VISIBLE_DEVICES" >&2
+    return 2
+  fi
+  if ! command -v flock >/dev/null 2>&1; then
+    echo "flock is required for the cooperative GPU lease." >&2
+    return 2
+  fi
+
+  mkdir -p "$GPU_LOCK_DIR"
+  local gpu_lock="$GPU_LOCK_DIR/gpu_${CUDA_VISIBLE_DEVICES}.lock"
+  exec {GPU_LEASE_FD}>"$gpu_lock"
+  echo "[gpu-lease] waiting for cooperative lock: $gpu_lock"
+  flock "$GPU_LEASE_FD"
+  echo "[gpu-lease] acquired GPU $CUDA_VISIBLE_DEVICES for this script (pid=$$)"
+}
+
+wait_for_gpu_memory() {
+  if ! command -v nvidia-smi >/dev/null 2>&1; then
+    echo "[gpu-memory] nvidia-smi not found; cannot verify free memory." >&2
+    return 2
+  fi
+
+  local start_epoch now_epoch free_mib
+  start_epoch="$(date +%s)"
+  while true; do
+    free_mib="$(
+      nvidia-smi -i "$CUDA_VISIBLE_DEVICES" \
+        --query-gpu=memory.free --format=csv,noheader,nounits 2>/dev/null \
+        | head -n 1 | tr -d '[:space:]'
+    )"
+    if [[ "$free_mib" =~ ^[0-9]+$ ]] && (( free_mib >= MIN_FREE_GPU_MEMORY_MIB )); then
+      echo "[gpu-memory] GPU $CUDA_VISIBLE_DEVICES ready: ${free_mib} MiB free"
+      return 0
+    fi
+
+    now_epoch="$(date +%s)"
+    if (( GPU_WAIT_TIMEOUT_SECONDS >= 0 )) \
+      && (( now_epoch - start_epoch >= GPU_WAIT_TIMEOUT_SECONDS )); then
+      echo "[gpu-memory] timed out: GPU $CUDA_VISIBLE_DEVICES has ${free_mib:-unknown} MiB free; need ${MIN_FREE_GPU_MEMORY_MIB} MiB" >&2
+      return 1
+    fi
+    echo "[gpu-memory] GPU $CUDA_VISIBLE_DEVICES has ${free_mib:-unknown} MiB free; waiting for ${MIN_FREE_GPU_MEMORY_MIB} MiB"
+    sleep "$GPU_MEMORY_POLL_SECONDS"
+  done
 }
 
 inference_complete() {
@@ -92,8 +146,10 @@ motion_scores = []
 bank_total_gb = []
 if log_path.is_file():
     text = log_path.read_text(encoding="utf-8", errors="ignore")
+    number = r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?"
     for keep, motion in re.findall(
-        r"keep_ratio=([^ ]+) motion_score=([^\\s]+)", text
+        rf"keep_ratio=(none|{number})\s+motion_score=(none|{number})",
+        text,
     ):
         if keep != "none":
             keep_ratios.append(float(keep))
@@ -101,10 +157,11 @@ if log_path.is_file():
             motion_scores.append(float(motion))
     bank_total_gb = [
         float(value)
-        for value in re.findall(r"\\[kv-bank\\].*?total_gb=([0-9.eE+-]+)", text)
+        for value in re.findall(r"\[kv-bank\].*?total_gb=([0-9.eE+-]+)", text)
     ]
 
 retrieved_tokens = []
+full_selection_tokens = []
 if event_path.is_file():
     for line in event_path.read_text(encoding="utf-8").splitlines():
         if not line.strip():
@@ -113,6 +170,10 @@ if event_path.is_file():
         tokens = int(event.get("retrieved_tokens_per_layer", 0))
         if tokens > 0:
             retrieved_tokens.append(tokens)
+            retrieval_frames = int(event.get("retrieval_frames", 0))
+            target_chunks = (retrieval_frames + 3) // 4
+            if len(event.get("selected_block_ids", [])) >= target_chunks:
+                full_selection_tokens.append(tokens)
 
 def describe(values):
     if not values:
@@ -133,6 +194,10 @@ summary = {
     "retrieved_frame_equivalents": describe(
         [tokens / 1560.0 for tokens in retrieved_tokens]
     ),
+    "full_selection_retrieved_tokens_per_layer": describe(full_selection_tokens),
+    "full_selection_retrieved_frame_equivalents": describe(
+        [tokens / 1560.0 for tokens in full_selection_tokens]
+    ),
     "max_observed_kv_bank_gb": max(bank_total_gb) if bank_total_gb else None,
 }
 (output / "compression_budget_summary.json").write_text(
@@ -142,7 +207,8 @@ summary = {
 print(
     f"[{case_name}] budget summary: "
     f"mean_keep={summary['keep_ratio']['mean']} "
-    f"mean_retrieval_eq={summary['retrieved_frame_equivalents']['mean']}"
+    f"steady_mean_retrieval_eq="
+    f"{summary['full_selection_retrieved_frame_equivalents']['mean']}"
 )
 PY
 }
@@ -212,6 +278,8 @@ run_case() {
 
 mkdir -p "$RUN_ROOT"
 cp "$DOC_TEMPLATE" "$RUN_ROOT/README.md"
+acquire_gpu_lease
+wait_for_gpu_memory
 
 # A vs B: compression damage at identical raw history coverage.
 run_case A_retr8_no_compression 8 0 1.0
@@ -249,6 +317,10 @@ for path in sorted(root.glob("*/compression_budget_summary.json")):
         "mean_motion_score": item["motion_score"]["mean"],
         "mean_retrieved_tokens_per_layer": item["retrieved_tokens_per_layer"]["mean"],
         "mean_retrieved_frame_equivalents": item["retrieved_frame_equivalents"]["mean"],
+        "steady_mean_retrieved_tokens_per_layer":
+            item["full_selection_retrieved_tokens_per_layer"]["mean"],
+        "steady_mean_retrieved_frame_equivalents":
+            item["full_selection_retrieved_frame_equivalents"]["mean"],
         "max_observed_kv_bank_gb": item["max_observed_kv_bank_gb"],
     })
 if rows:

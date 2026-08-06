@@ -3,6 +3,24 @@
 本实验在 10 秒 loop-closure 测试集上，对 retrieval 历史覆盖范围、固定
 KV 压缩和相机运动自适应压缩进行六组对比。
 
+## GPU 占用保护
+
+脚本启动时会取得 `/tmp/minwm_gpu_locks/gpu_<编号>.lock` 的协作式独占锁，
+并持续等待目标 GPU 至少有 44000 MiB 空闲显存后才开始推理。锁会保持到六组
+实验全部结束，因此使用相同锁约定的 minWM 实验不会互相抢占同一张卡。
+
+```bash
+CUDA_VISIBLE_DEVICES=3 \
+MIN_FREE_GPU_MEMORY_MIB=44000 \
+GPU_MEMORY_POLL_SECONDS=30 \
+GPU_WAIT_TIMEOUT_SECONDS=-1 \
+bash Wan21/scripts/inference/run_loop10s_worldkv_compression_budget_ablation.sh
+```
+
+`GPU_WAIT_TIMEOUT_SECONDS=-1` 表示一直等待；设为 `0` 表示显存不足时立即失败。
+该锁无法约束不采用此锁的外部进程。若要严格阻止任意其他进程抢卡，应通过集群
+调度器申请独占 GPU，或请管理员设置 NVIDIA `EXCLUSIVE_PROCESS` 计算模式。
+
 ## 统一实验设置
 
 - Prompt：`Wan21/prompts/demos_loop_closure/prompts.txt`
@@ -240,8 +258,9 @@ compression_budget_summary.json
 compression_budget_summary.csv
 ```
 
-在比较 D、E、F 的 loop-closure 指标之前，应先用该文件确认三组的实际平均
-retrieval token 预算接近。
+在比较 D、E、F 的 loop-closure 指标之前，应优先检查
+`steady_mean_retrieved_frame_equivalents`。该字段只统计已经选满目标 chunk
+数量的 retrieval event，不会被 rollout 初期历史 chunk 不足的事件拉低。
 
 所有组使用相同的 prompt index、seed 和输出文件名，可以直接进行同名视频的
 配对观察。

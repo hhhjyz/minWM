@@ -122,8 +122,8 @@ class WanDiffusionWrapper(torch.nn.Module):
             sink_size=0,
             fixed_sink_rope_rebase=False,
             tri_region_rope_rebase=False,
-            rope_train_length=21,
-            rope_local_window=9,
+            rope_train_length=19,
+            rope_local_window=4,
             use_camera=False
     ):
         super().__init__()

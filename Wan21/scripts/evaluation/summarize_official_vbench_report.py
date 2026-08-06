@@ -18,6 +18,7 @@ DIMENSIONS = [
     "background_consistency",
     "temporal_flickering",
     "motion_smoothness",
+    "dynamic_degree",
     "aesthetic_quality",
     "imaging_quality",
 ]
@@ -121,9 +122,9 @@ def _table(title: str, rows: list[dict[str, Any]]) -> str:
         r"\scriptsize",
         r"\setlength{\tabcolsep}{3pt}",
         rf"\caption{{{_latex_escape(title)}}}",
-        r"\begin{tabular}{llrrrrrrr}",
+        r"\begin{tabular}{llrrrrrrrr}",
         r"\toprule",
-        r"Seed & Case & N & Subject & Background & Flicker & Smooth & Aesthetic & Imaging \\",
+        r"Seed & Case & N & Subject & Background & Flicker & Smooth & Dynamic & Aesthetic & Imaging \\",
         r"\midrule",
     ]
     for row in rows:
@@ -137,6 +138,7 @@ def _table(title: str, rows: list[dict[str, Any]]) -> str:
                     _fmt(row["background_consistency"]),
                     _fmt(row["temporal_flickering"]),
                     _fmt(row["motion_smoothness"]),
+                    _fmt(row["dynamic_degree"]),
                     _fmt(row["aesthetic_quality"]),
                     _fmt(row["imaging_quality"]),
                 ]
@@ -187,8 +189,8 @@ def write_latex(rows: list[dict[str, Any]], output_tex: Path, roots: list[Path])
         r"\maketitle",
         r"\section*{Notes}",
         "The tables summarize official VBench raw quality dimensions for generated videos. "
-        "They are not final VBench leaderboard scores: semantic prompt dimensions were not run, "
-        "and \\texttt{dynamic\\_degree} was skipped because its RAFT checkpoint download timed out previously.",
+        "They are not final VBench leaderboard scores because semantic prompt dimensions were not run. "
+        "All seven configured quality dimensions, including \\texttt{dynamic\\_degree}, are reported.",
         "",
         "Evaluated roots:",
         r"\begin{itemize}",

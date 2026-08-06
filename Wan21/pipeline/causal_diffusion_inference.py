@@ -56,6 +56,12 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
         self.sink_bank_seed = int(getattr(args, "sink_bank_seed", 0))
         self.sink_size_frames = get_model_sink_size_frames(self.generator)
         self.retrieval_enable = bool(getattr(args, "retrieval_enable", False))
+        self.tri_region_rope_rebase = bool(
+            getattr(self.generator.model, "tri_region_rope_rebase", False)
+        )
+        self.rope_train_length = int(
+            getattr(self.generator.model, "rope_train_length", 19)
+        )
         self.retrieval_granularity = normalize_retrieval_granularity(
             getattr(args, "retrieval_granularity", "chunk")
         )
@@ -113,6 +119,11 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                 f"granularity={self.retrieval_granularity} "
                 f"retrieval_frames={self.retrieval_frames} recent_exclusion={self.retrieval_recent_frames}"
             )
+            if self.tri_region_rope_rebase:
+                print(
+                    f"Tri-region warm-up: retrieval/rebase start at "
+                    f"current_start_frame >= {self.rope_train_length}"
+                )
 
         # Latency of producing the first chunk (set by inference()).
         self.last_chunk0_latency = None
@@ -141,6 +152,14 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
         device,
     ):
         if not self.retrieval_enable or self.retrieval_frames <= 0:
+            return None
+        # Tri-region warm-up: populate the bank normally, but do not expose
+        # retrieval KV until the real RoPE clock reaches T.  This matches the
+        # model-side transition that enables query/K rebase at the same chunk.
+        if (
+            self.tri_region_rope_rebase
+            and current_start_frame < self.rope_train_length
+        ):
             return None
         retrieval_t0 = time.perf_counter()
         selector = (

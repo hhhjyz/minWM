@@ -192,6 +192,24 @@ def collect_results(eval_dir: Path, dimensions: list[str]) -> tuple[list[dict[st
     return rows, summary
 
 
+def completed_dimensions(eval_dir: Path) -> set[str]:
+    """Return dimensions backed by a complete official eval-results file."""
+    completed: set[str] = set()
+    for result_file in sorted(eval_dir.glob("results_*_eval_results.json")):
+        try:
+            payload = json.loads(result_file.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        for dimension, result in payload.items():
+            # Official VBench writes [aggregate_score, per_video_results].
+            # Requiring both entries prevents treating a partial file as done.
+            if isinstance(result, list) and len(result) >= 2:
+                completed.add(str(dimension))
+    return completed
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--timing-csv", type=Path, required=True)
@@ -241,7 +259,11 @@ def main() -> None:
     if args.hf_home is not None:
         env_overrides["HF_HOME"] = str(args.hf_home.resolve())
 
+    already_completed = completed_dimensions(raw_dir)
     for offset, dimension in enumerate(dimensions):
+        if dimension in already_completed:
+            print(f"[official-vbench] skip completed dimension: {dimension}", flush=True)
+            continue
         master_port = find_free_port(args.master_port + offset)
         run_dimension(
             vbench_root=args.vbench_root.resolve(),

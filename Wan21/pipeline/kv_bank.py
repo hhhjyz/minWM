@@ -547,6 +547,7 @@ class KVBank:
         payload = {
             "k": torch.cat(k_parts, dim=1),
             "v": torch.cat(v_parts, dim=1),
+            "chunk_token_lengths": [int(part.shape[1]) for part in k_parts],
             "block_ids": [self.blocks[index].block_id for index in selected_block_indices],
             "src_frame_ids": [self.blocks[index].frame_start for index in selected_block_indices],
             "chunk_size_frames": self.blocks[selected_block_indices[0]].frame_end - self.blocks[selected_block_indices[0]].frame_start,
@@ -603,6 +604,12 @@ class KVBank:
                     anchor_rotate=compression_anchor_rotate,
                     pooled=compression_pooled,
                 )
+            num_chunks = len(selected_block_indices)
+            if payload["k"].shape[1] % num_chunks:
+                raise ValueError("runtime-compressed retrieval KV must divide across selected chunks")
+            payload["chunk_token_lengths"] = [
+                int(payload["k"].shape[1] // num_chunks)
+            ] * num_chunks
 
         return payload
 
@@ -783,6 +790,7 @@ class KVBank:
         payload = {
             "k": torch.cat(k_parts, dim=1),
             "v": torch.cat(v_parts, dim=1),
+            "chunk_token_lengths": [int(part.shape[1]) for part in k_parts],
             "block_ids": block_ids,
             "src_frame_ids": src_frame_ids,
             "chunk_size_frames": 1,

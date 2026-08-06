@@ -242,28 +242,34 @@ def package(args: argparse.Namespace) -> None:
         seed = seed_name.removeprefix("seed_")
         model_id = f"{args.model_prefix}_{case_name}_seed{seed}"
         with timing_path.open(newline="", encoding="utf-8") as handle:
+            # A resumed rollout may append the same prompt more than once.  Keep
+            # the last successful row so packaging is idempotent even before a
+            # timing CSV is normalized in place.
+            successful: dict[int, dict[str, str]] = {}
             for timing in csv.DictReader(handle):
                 if timing.get("status") not in {"generated", "skipped_exists"}:
                     continue
                 prompt_index = int(timing["prompt_index"])
-                if prompt_index not in manifest:
-                    raise ValueError(
-                        f"prompt_index={prompt_index} from {timing_path} "
-                        "is absent from the adapter manifest"
-                    )
-                source = Path(timing["output_path"]).resolve()
-                if not source.is_file():
-                    raise FileNotFoundError(f"Generated video not found: {source}")
-                item = manifest[prompt_index]
-                subset = item["subset"]
-                sample_id = item["sample_id"]
-                condition_id = item["condition_id"]
-                relative_video = (
-                    Path("outputs") / subset / sample_id / condition_id / "video.mp4"
+                successful[prompt_index] = timing
+        for prompt_index, timing in sorted(successful.items()):
+            if prompt_index not in manifest:
+                raise ValueError(
+                    f"prompt_index={prompt_index} from {timing_path} "
+                    "is absent from the adapter manifest"
                 )
-                model_root = dataset_root / "models" / model_id
-                _link_video(source, model_root / relative_video, args.link_mode)
-                row = {
+            source = Path(timing["output_path"]).resolve()
+            if not source.is_file():
+                raise FileNotFoundError(f"Generated video not found: {source}")
+            item = manifest[prompt_index]
+            subset = item["subset"]
+            sample_id = item["sample_id"]
+            condition_id = item["condition_id"]
+            relative_video = (
+                Path("outputs") / subset / sample_id / condition_id / "video.mp4"
+            )
+            model_root = dataset_root / "models" / model_id
+            _link_video(source, model_root / relative_video, args.link_mode)
+            row = {
                     "item_id": f"{subset}:{sample_id}:{condition_id}",
                     "dataset_id": "mbencha",
                     "subset": subset,
@@ -280,8 +286,8 @@ def package(args: argparse.Namespace) -> None:
                         "seed": int(seed),
                         "source_video": str(source),
                     },
-                }
-                packages.setdefault(model_id, []).append(row)
+            }
+            packages.setdefault(model_id, []).append(row)
 
     for model_id, rows in packages.items():
         samples_path = dataset_root / "models" / model_id / "samples.jsonl"

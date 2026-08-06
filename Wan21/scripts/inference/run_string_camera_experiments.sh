@@ -27,6 +27,7 @@ KV_BANK_LOG_INTERVAL="${KV_BANK_LOG_INTERVAL:-1}"
 KV_BANK_WARN_MEMORY_GB="${KV_BANK_WARN_MEMORY_GB:-128}"
 
 RETRIEVAL_FRAMES="${RETRIEVAL_FRAMES:-12}"
+TRI_REGION_RETRIEVAL_FRAMES="${TRI_REGION_RETRIEVAL_FRAMES:-8}"
 COMPRESSED_RETRIEVAL_FRAMES="${COMPRESSED_RETRIEVAL_FRAMES:-$RETRIEVAL_FRAMES}"
 DYNAMIC_COMPRESSED_RETRIEVAL_FRAMES="${DYNAMIC_COMPRESSED_RETRIEVAL_FRAMES:-$COMPRESSED_RETRIEVAL_FRAMES}"
 RETRIEVAL_RECENT_FRAMES="${RETRIEVAL_RECENT_FRAMES:-8}"
@@ -37,6 +38,8 @@ RETRIEVAL_FOV_V_DEG="${RETRIEVAL_FOV_V_DEG:-35.0}"
 RETRIEVAL_HYBRID_FOV_WEIGHT="${RETRIEVAL_HYBRID_FOV_WEIGHT:-0.5}"
 RETRIEVAL_ROPE_CORRECTION="${RETRIEVAL_ROPE_CORRECTION:-0}"
 PROPE_REENCODE_MODE="${PROPE_REENCODE_MODE:-none}"
+ROPE_TRAIN_LENGTH="${ROPE_TRAIN_LENGTH:-19}"
+ROPE_LOCAL_WINDOW="${ROPE_LOCAL_WINDOW:-4}"
 
 KV_COMPRESSION_KEEP_RATIO="${KV_COMPRESSION_KEEP_RATIO:-0.5}"
 KV_COMPRESSION_DYNAMIC_MIN_KEEP="${KV_COMPRESSION_DYNAMIC_MIN_KEEP:-0.25}"
@@ -72,6 +75,8 @@ DRY_RUN="${DRY_RUN:-0}"
 DEFAULT_CASES=(
   baseline
   fixed_sink
+  fixed_sink_only_rope_rebase
+  tri_region_rope_rebase
   periodic_sink
   pose_compress_store
   worldkv_fov_compress_store
@@ -150,6 +155,8 @@ retrieval_fov_radius=$RETRIEVAL_FOV_RADIUS
 retrieval_fov_h_deg=$RETRIEVAL_FOV_H_DEG
 retrieval_fov_v_deg=$RETRIEVAL_FOV_V_DEG
 prope_reencode_mode=$PROPE_REENCODE_MODE
+rope_train_length=$ROPE_TRAIN_LENGTH
+rope_local_window=$ROPE_LOCAL_WINDOW
 compression_keep_ratio=$KV_COMPRESSION_KEEP_RATIO
 official_vbench=$EVAL_OFFICIAL_VBENCH_ENABLE
 loop_closure_eval=$EVAL_LOOP_CLOSURE_ENABLE
@@ -271,11 +278,27 @@ run_case() {
   local compression_at_store=0
   local compression_pooled=0
   local compression_dynamic=0
+  local compression_keep_ratio="$KV_COMPRESSION_KEEP_RATIO"
+  local fixed_sink_rope_rebase=0
+  local tri_region_rope_rebase=0
+  local apply_default_tri_region=1
 
   case "$case_name" in
     baseline) ;;
     fixed_sink)
       sink_strategy=fixed; sink_size="$SINK_SIZE" ;;
+    fixed_sink_rope_rebase|fixed_sink_only_rope_rebase)
+      # Two-region real-time RoPE: move only sink K immediately before
+      # [recent/current]; do not rebase local K or current Q.
+      sink_strategy=fixed; sink_size="$SINK_SIZE"
+      fixed_sink_rope_rebase=1 ;;
+    tri_region_rope_rebase)
+      # Three-region bounded RoPE: [fixed sink | retrieved KV | recent/current].
+      # Retrieval KV is intentionally left uncompressed for this case.
+      sink_strategy=fixed; sink_size="$SINK_SIZE"
+      retrieval_frames="$TRI_REGION_RETRIEVAL_FRAMES"
+      retrieval_enable=1; retrieval_metric=worldkv_fov; kv_bank_enable=1
+      tri_region_rope_rebase=1 ;;
     periodic_sink)
       sink_strategy=periodic; sink_size="$SINK_SIZE"; sink_interval="$SINK_UPDATE_INTERVAL" ;;
     bank_random_sink|bank_uniform_sink|bank_pose_sink|bank_worldkv_fov_sink)
@@ -311,8 +334,46 @@ run_case() {
       retrieval_enable=1; retrieval_metric=worldkv_fov; kv_bank_enable=1
       retrieval_frames="$DYNAMIC_COMPRESSED_RETRIEVAL_FRAMES"
       compression_enable=1; compression_at_store=1; compression_pooled=1; compression_dynamic=1 ;;
+    retr8_no_compression)
+      sink_strategy=fixed; sink_size="$SINK_SIZE"
+      retrieval_enable=1; retrieval_metric=worldkv_fov; kv_bank_enable=1
+      retrieval_frames=8; apply_default_tri_region=0 ;;
+    retr8_compression_r050)
+      sink_strategy=fixed; sink_size="$SINK_SIZE"
+      retrieval_enable=1; retrieval_metric=worldkv_fov; kv_bank_enable=1
+      retrieval_frames=8; compression_keep_ratio=0.5
+      compression_enable=1; compression_at_store=1; compression_pooled=1
+      apply_default_tri_region=0 ;;
+    retr12_compression_r050)
+      sink_strategy=fixed; sink_size="$SINK_SIZE"
+      retrieval_enable=1; retrieval_metric=worldkv_fov; kv_bank_enable=1
+      retrieval_frames=12; compression_keep_ratio=0.5
+      compression_enable=1; compression_at_store=1; compression_pooled=1
+      apply_default_tri_region=0 ;;
+    retr16_compression_r033)
+      sink_strategy=fixed; sink_size="$SINK_SIZE"
+      retrieval_enable=1; retrieval_metric=worldkv_fov; kv_bank_enable=1
+      retrieval_frames=16; compression_keep_ratio=0.3333333333333333
+      compression_enable=1; compression_at_store=1; compression_pooled=1
+      apply_default_tri_region=0 ;;
+    retr8_compression_r033)
+      sink_strategy=fixed; sink_size="$SINK_SIZE"
+      retrieval_enable=1; retrieval_metric=worldkv_fov; kv_bank_enable=1
+      retrieval_frames=8; compression_keep_ratio=0.3333333333333333
+      compression_enable=1; compression_at_store=1; compression_pooled=1
+      apply_default_tri_region=0 ;;
     *) echo "Unknown case: $case_name" >&2; return 2 ;;
   esac
+
+  # All retrieval experiments use the same delayed tri-region layout:
+  # sink 0..3, retrieval 4..11, recent/current 12..19.  Retrieval remains
+  # disabled during warm-up and starts together with rebase at T=19.
+  if [ "$retrieval_enable" = "1" ] && [ "$apply_default_tri_region" = "1" ]; then
+    sink_strategy=fixed
+    sink_size="$SINK_SIZE"
+    retrieval_frames="$TRI_REGION_RETRIEVAL_FRAMES"
+    tri_region_rope_rebase=1
+  fi
 
   if bool_enabled "$SKIP_COMPLETED" && inference_complete "$output_folder"; then
     echo "[seed=$seed case=$case_name] generation already complete; evaluating existing output"
@@ -365,8 +426,12 @@ run_case() {
     RETRIEVAL_HYBRID_FOV_WEIGHT="$RETRIEVAL_HYBRID_FOV_WEIGHT"
     RETRIEVAL_ROPE_CORRECTION="$RETRIEVAL_ROPE_CORRECTION"
     PROPE_REENCODE_MODE="$PROPE_REENCODE_MODE"
+    FIXED_SINK_ROPE_REBASE="$fixed_sink_rope_rebase"
+    TRI_REGION_ROPE_REBASE="$tri_region_rope_rebase"
+    ROPE_TRAIN_LENGTH="$ROPE_TRAIN_LENGTH"
+    ROPE_LOCAL_WINDOW="$ROPE_LOCAL_WINDOW"
     KV_COMPRESSION_ENABLE="$compression_enable"
-    KV_COMPRESSION_KEEP_RATIO="$KV_COMPRESSION_KEEP_RATIO"
+    KV_COMPRESSION_KEEP_RATIO="$compression_keep_ratio"
     KV_COMPRESSION_AT_STORE="$compression_at_store"
     KV_COMPRESSION_POOLED="$compression_pooled"
     KV_COMPRESSION_DYNAMIC_ENABLE="$compression_dynamic"

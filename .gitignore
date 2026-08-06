@@ -137,6 +137,7 @@ Wan21/wan_models/
 *.pt
 *.pth
 *.ckpt
+*.whl
 
 # Generated videos and images
 *.avi

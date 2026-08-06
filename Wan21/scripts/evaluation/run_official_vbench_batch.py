@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -58,7 +59,15 @@ def main() -> None:
     parser.add_argument("--vbench-cache-dir", type=Path, default=None)
     parser.add_argument("--compile-pdf", action="store_true")
     parser.add_argument("--force", action="store_true", help="Re-run cases even when official metrics already exist.")
+    parser.add_argument(
+        "--cuda-visible-devices",
+        default=None,
+        help="Optional CUDA_VISIBLE_DEVICES value inherited by official VBench subprocesses.",
+    )
     args = parser.parse_args()
+
+    if args.cuda_visible_devices is not None:
+        os.environ["CUDA_VISIBLE_DEVICES"] = args.cuda_visible_devices
 
     minwm_root = args.minwm_root.resolve()
     roots = [root.resolve() for root in args.root]

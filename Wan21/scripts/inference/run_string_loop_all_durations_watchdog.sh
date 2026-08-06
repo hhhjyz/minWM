@@ -24,7 +24,7 @@ DURATIONS="${DURATIONS:-10s 15s 20s 30s}"
 # All selected devices cooperate on each video through sequence parallelism.
 CUDA_DEVICES="${CUDA_DEVICES:-${CUDA_VISIBLE_DEVICES:-0}}"
 CUDA_DEVICE_ORDER="${CUDA_DEVICE_ORDER:-PCI_BUS_ID}"
-CASES="${CASES:-baseline fixed_sink periodic_sink bank_random_sink bank_uniform_sink bank_pose_sink bank_worldkv_fov_sink pose worldkv_fov hy_fov hybrid pose_compress_store worldkv_fov_compress_store worldkv_fov_dynamic_compress_store}"
+CASES="${CASES:-baseline fixed_sink fixed_sink_only_rope_rebase tri_region_rope_rebase periodic_sink bank_random_sink bank_uniform_sink bank_pose_sink bank_worldkv_fov_sink pose worldkv_fov hy_fov hybrid pose_compress_store worldkv_fov_compress_store worldkv_fov_dynamic_compress_store}"
 
 if [ -z "$CUDA_DEVICES" ] || [[ "$CUDA_DEVICES" =~ [[:space:]] ]]; then
   echo "CUDA_DEVICES must be a non-empty comma-separated list without spaces, e.g. 0,1." >&2
@@ -96,6 +96,8 @@ export CUDA_DEVICE_ORDER
 export CUDA_VISIBLE_DEVICES="$CUDA_DEVICES"
 
 mkdir -p "$OUTPUT_ROOT"
+read -r -a CASE_LIST <<< "$CASES"
+CASE_COUNT="${#CASE_LIST[@]}"
 exec 9>"$LOCK_FILE"
 if ! flock -n 9; then
   printf '[%s] another watchdog already holds %s\n' "$(date '+%F %T')" "$LOCK_FILE" >> "$QUEUE_LOG"
@@ -207,7 +209,7 @@ for spec in "${RESOLVED_DURATIONS[@]}"; do
     runner_status=$?
 
     if duration_complete "$run_root"; then
-      log "$label complete videos=$((MAX_PROMPTS * 14)) runner_status=$runner_status"
+      log "$label complete videos=$((MAX_PROMPTS * CASE_COUNT)) cases=$CASE_COUNT runner_status=$runner_status"
       break
     fi
 
